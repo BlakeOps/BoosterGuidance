@@ -1,6 +1,304 @@
 Changelog
 
-1.2.0.1 
+1.2.0.2 (unreleased)
+	Added landing site preset library: named targets (body, lat/lon/alt) saved globally in
+	  GameData/BoosterGuidance/PluginData/landing_sites.cfg, with built-in KSC presets,
+	  Apply/Save/Delete in the main window
+	Added forced upright terminal landing: below Upright Height and once horizontal speed is
+	  below Upright Max Horiz Speed the landing burn commands a pure vertical attitude to
+	  prevent tip-overs; steering angle is ramped down below Upright Height. Set Upright
+	  Height to 0 for legacy behaviour
+	Fixed noSteerHeight setting not being applied to the controller
+	Fixed flight logs being polluted by simulation steps (logged state appeared frozen)
+	Fixed flight logs silently stopping: BLController's finalizer shut down global logging
+	  whenever a simulation copy was garbage collected, so Actual.dat could end up empty
+	Log writers now flush every line so data survives a crash or forced quit
+	Added Starship recovery profile (per-vessel, default Falcon 9): belly-flop second-stage
+	  recovery with manual deorbit aimed by a prediction scope, belly-first attitude from
+	  burn end through entry, belly-normal tilt steering (15 deg cap, low-altitude fade,
+	  live Correction Gain slider), physics-triggered flip to tail-down, and the shared
+	  landing burn. Enable anywhere - the entry phase is picked from the vessel state
+	Added deorbit scope for the Starship profile: while guidance is disabled, the predicted
+	  belly-flop impact point (from the current maneuver node, or the current orbit) is
+	  shown as a map cross with a deviation readout, updated about once per second
+	Starship profile manages time warp: forced to 1x below the atmosphere interface plus a
+	  10 km margin and during all atmospheric phases; Falcon 9 flights are unaffected
+	Added attitude tracking warning: if the vessel cannot hold the commanded belly-flop
+	  attitude (>20 deg for several seconds) a warning is logged and shown; guidance
+	  continues (no fallback) so flight data shows what the craft can actually do
+	Fixed the root cause of empty flight logs: Simulate.ToGround called Utils.EndLogging()
+	  at the end of every logged simulation, shutting down all log writers ~25ms after
+	  logging started (found via new diagnostic logging, now written to Logs/SpaceTux/)
+	Runtime diagnostic messages (guidance enable/disable, logging start/stop, first Fly
+	  tick) are now logged at INFO level in all builds
+	Fixed guidance disabling itself on the first frame when enabled while landed: arming on
+	  the pad now waits until the vessel is airborne and past its apex before taking over,
+	  leaving the ascent to your ascent autopilot. Enabling while airborne is unchanged
+	Added steer rate damping: steer corrections are reduced by Steer Damping (s) times the
+	  lateral angular rate to suppress descent/landing oscillation. Set to 0 to disable
+	Smoothed steer gain schedule: the hard aero/thrust zero-band is now a continuous fade,
+	  removing the steering authority flicker near the band boundary
+	Fixed terminal hover: the last ~30m was flown at a constant -2m/s (touchdownMargin
+	  saturating the suicide-burn profile), causing a 12s+ hover; the descent rate now
+	  tapers proportionally to height above ground, reaching touchdown speed at the surface
+	Fixed landing-burn throttle bang-bang limit cycle near the ground: the throttle law
+	  divided by the raw timestep, making it 100x hotter in real flight than in simulation;
+	  it now uses a fixed 0.5s response time constant
+	Fixed landing-burn undershoot on steep profiles: the proportional-only throttle law
+	  settled into a steady-state speed deficit (~11 m/s) while tracking the sloped suicide
+	  profile, causing a crash on touchdown. The law now feedforwards the profile slope
+	  (the deceleration needed to stay on profile) and reserves feedback for the residual
+	Fixed attitude reference for vessels with a sideways root part (e.g. decoupler-rooted
+	  boosters): attitude now comes from the control point (ReferenceTransform) used by SAS,
+	  fixing steer damping, steer smoothing, attitude error and the throttle verticality
+	  compensation (which was amplifying throttle up to 10x); the compensation can now at
+	  most double thrust. (An attempt to use the engine thrust transforms instead was
+	  reverted: on the test vessel all attitude axes turned out to be the same vector, and
+	  the thrust transforms additionally rotate with the gimbal, injecting noise into the
+	  rate damping)
+	Fixed enable-during-ascent picking a nonsensical phase: enabling guidance below
+	  reentryBurnAlt while still ascending auto-picked AeroDescent, and the landing-burn
+	  transition fired immediately against the ascending trajectory, so the return program
+	  appeared to do nothing until re-enabled above reentryBurnAlt. Ascending vessels now
+	  always start in BoostBack, and the landing burn can never start while ascending
+	Fixed descent crash from unbounded steer damping: the damping subtraction could rotate
+	  the steer command tens of degrees past horizontal in turbulent fast descent (real body
+	  rates reach ~1 rad/s), leaving the booster near-horizontal at throttle onset. The
+	  total steer correction (error term minus damping) is now clamped to each phase's
+	  maxAoA budget in all phases
+	Fixed landing burn thrusting sideways while badly tilted: throttle is now cut to minimum
+	  whenever the vessel is more than ~70 degrees from vertical while falling faster than
+	  50 m/s (it cannot decelerate the fall in that state, only fling the impact point
+	  downrange). The slow terminal hover is never affected
+	Landing Burn Velocity Damping (brakes lateral velocity during terminal homing) is now
+	  present but disabled by default after its virtual aim point proved invalid at high
+	  horizontal speeds; it may be re-enabled for the slow terminal regime in a future
+	  release
+	Added automatic low-altitude steering authority schedule: the effective max AoA ramps
+	  from full authority above 15km down to an absolute cap (default 7 degrees) below 4km,
+	  automating the manual steer-gain reduction previously needed to stop the descent
+	  oscillation. The cap is absolute so it works regardless of the GUI steer
+	  gain sliders (per-phase maxAoA derives from them). The ramp top covers the whole
+	  fast landing-burn descent: with a 6km top the vessel still shook from burn onset
+	  (~14km) down to 5km. Schedule parameters are persisted per vessel
+	Added Turn Around phase: the return program now starts with an RCS-only flip to point
+	  the nose opposite the predicted impact error - the direction the boostback burn will
+	  need to thrust, whether the impact point overshoots the target (braking,
+	  nose anti-velocity) or falls short of it (accelerating, nose pro-velocity) -
+	  then ignites the boostback burn once aligned (within 10 degrees, or after 60s at
+	  the latest). RCS is kept on automatically during the flip; simulation assumes an
+	  instant turn so predictions are unaffected. Also available as a phase button
+	Flight logs now record all guidance settings whenever they change (including mid-flight
+	  GUI edits) as '# settings ...' comment lines in Actual.dat
+	Fixed BoostBack cutting itself on simulation noise: the cutoff now tracks the minimum
+	  of a smoothed target error and requires sustained (>1s) growth before giving up.
+	  A single-tick prediction jump (883m to 1960m) was ending the burn while it was
+	  still converging ~30m/0.1s, entering the coast with ~2km of avoidable error
+	Fixed touchdown drifting tens of metres past the target below No Steer Height: the
+	  target error was frozen below 200m while the vessel still carried ~18 m/s sideways
+	  (flight 17: 12m at 295m grew to 47m at touchdown). The impact error is now
+	  dead-reckoned locally (position offset + velocity x y/|vy|, the drift integral
+	  under constant-deceleration braking), which needs no simulation and stays smooth,
+	  so homing continues to touchdown
+	Added velocity-to-go terminal guidance: below 4km (blended in over 2km) the
+	  landing burn tracks the horizontal velocity that nulls the position error
+	  by touchdown (v_des = -offset/tGo) instead of chasing the predicted impact
+	  point. Proportional impact homing converts position error into closing
+	  velocity, so the vessel used to arrive on target but too hot to brake at
+	  the low-altitude tilt cap (flight 18: 1.4m offset at 296m with 30 m/s
+	  sideways, drifted 44m past while braking); the velocity objective brakes
+	  the approach from 4km, while there is still descent time to shape it.
+	  This also finally applies steering below No Steer Height - that branch
+	  previously carried no correction at all, so the drift there ran unopposed
+	Terminal RCS translation braking is now OPT-IN and disabled by default:
+	  with top-mounted RCS blocks (the usual booster layout) translation thrust
+	  acts far from the centre of mass and the induced torque can tip the
+	  vessel over near the ground. Enable by setting Rcs Translate Alt > 0 only
+	  if your RCS sits near the centre of mass
+	Fixed the return fuel hint showing nonsense: the simulated boostback idled at minimum
+	  throttle (the sim's inner control ticks never see the predicted error), so the
+	  required propellant came out near-zero. The boostback share is now estimated
+	  analytically (|ballistic miss| / flight time of delta-V, with a loss margin) on top
+	  of the coast-only simulation, and the computed values are logged each tick
+	Turn Around now aims along the predicted impact-error direction (the boostback
+	  thrust direction) for any impact geometry - downrange overshoot, undershoot, or
+	  cross-range at any angle off the velocity - falling back to horizontal retrograde
+	  only when the error is below 100m and its direction is not meaningful
+	Added coast autowarp: physics timewarp (default 3x, MechJeb-style) engages during
+	  the Coasting phase on the active vessel and drops back to 1x for every active
+	  phase or when guidance is disabled. Physics warp keeps guidance fully in
+	  control; a higher manual warp setting is never lowered
+	Return fuel hint now displays delta-V (need / have / margin in m/s) instead of
+	  tonnes, and the boostback share is computed with the correct mass units
+	  (KSP totalMass is tonnes - the share was 1000x small, so the hint always
+	  read "need 0.0t")
+	Added return fuel hint (optimal return point advisory): while guidance is disabled
+	  and a target is set, the Info line shows the simulated propellant needed to fly
+	  back from the current state vs what is aboard (updated ~1Hz). Enable guidance
+	  while the margin is positive - the margin shrinking during ascent tells you when
+	  the return is still feasible
+	Reverted the terminal descent to the proven impact-error homing scheme
+	  (flight 16: 31.3m): the velocity-to-go mid-descent blend converged the
+	  vessel's position without aligning the trajectory line through the
+	  target, so with no thrust to brake at min throttle it flew PAST the
+	  target and the braking slide added hundreds of metres (flight 20: 471m).
+	  The blend is disabled (v2gHeight=0) pending an alignment-aware
+	  formulation. Velocity braking below No Steer Height is kept: there the
+	  trajectory is already aligned and killing the residual drift is the only
+	  remaining task (flight 17/18 drifted ~35m unopposed below 200m).
+	  (Flight 21 with this scheme: 8.5m, best result ever)
+	Velocity braking now engages earlier and lands gentler: it hands over from
+	  the impact-error law between 600m and No Steer Height (was: only below
+	  200m), so the residual speed is killed by ~200m and the forced-upright
+	  latch engages early - flight 21 was still translating under a 12-degree
+	  correction in the final 50m and broke a landing leg. The correction
+	  budget also fades to a quarter between 150m and 30m to protect the
+	  touchdown attitude
+	Fixed terminal tip-over from compounding failure modes in the last 100m
+	  (flight 22: reached 2.6m from the target at 80m, then the velocity-to-go
+	  law's v_des reversal - "stop, then go the other way" - pumped the
+	  horizontal speed from 5 to 13 m/s at full throttle in the final 50m; as
+	  the descent rate collapsed at the end of the suicide profile the
+	  retro-lean steer term atan(vh/(20-vy)) grew past 30 degrees, and the
+	  vessel drifted from 2.6m to 33m while braking at min throttle and tipped
+	  over). The velocity law is now BRAKE-ONLY (v_des = 0) within 15m of the
+	  target - this close, stopping is the whole job - and the total steer
+	  tilt is hard-capped (default 15 degrees) below 100m so no combination of
+	  retro-lean and corrections can command a tipping attitude at touchdown
+	Fixed guidance dying from the first tick on every enable (flight 23: over
+	  10000 MissingMethodExceptions, vessel coasted uncontrolled over the apex
+	  and crashed). The new tilt cap called Vector3d.Slerp, which is declared
+	  InternalCall in Assembly-CSharp but has no registered native
+	  implementation in KSP's Mono runtime - the first execution throws
+	  MissingMethodException, and since the per-tick prediction simulation
+	  descends through 100m every tick, every enable was dead on arrival.
+	  The cap now rescales the perpendicular steer component with managed
+	  vector math (exact same 15-degree cap). Vector3d.Angle is managed and
+	  was never affected. A static IL audit (.tools/diag/MissingMethodAudit)
+	  now fails the build-time check on any call to an Assembly-CSharp
+	  InternalCall method so this class of bug is caught before flight
+	Fixed terminal hover-until-fuel-exhaustion (flight 25: after a perfect
+	  landing burn the vessel parked at 35m for 33s at hover throttle -
+	  mean commanded accel 9.79 = g - then fell and crashed when the tanks
+	  ran dry). The suicide profile's feedforward slope diverges like
+	  1/sqrt(y) as effective height y->0+, which gives the throttle law a
+	  hover equilibrium exactly at the profile zero: within the vertical-
+	  speed noise band the command brackets g (falling: 14.6 m/s^2,
+	  rising: 4.2), so a gently-arriving vessel regulates itself onto the
+	  wall and never reaches the touchdown taper below it. A hot arrival
+	  punches through on momentum (flight 26 with 4 engines: -11.4 m/s at
+	  the boundary, then a textbook taper landing) - which branch you got
+	  was a lottery. The throttle law now hands over to the finite-slope
+	  touchdown taper at 2m effective height (taperSwitchY), where the
+	  taper target is always SLOWER than the suicide profile, so the
+	  handoff is always a catch (brake), never a dive; above the switch
+	  the law is unchanged. The law is extracted as a pure static
+	  (BLController.SuicideBurnThrottle) covered by a replay harness
+	  (.tools/diag/ThrottleReplay) that replays the logged flight-25
+	  states through the compiled DLL and asserts the equilibrium is gone
+	Fixed the return fuel hint underestimating the return propellant by the
+	  entire landing reserve (flight 29: at enable it read need ~660 m/s;
+	  the actual return took ~1140 m/s - a barely-made-it return). The
+	  zero-steering estimate simulation's own landing-burn accounting came
+	  out at ~44 kg (vs 18.2 t actually burned) and reentry at ~0, while
+	  the boostback share itself was accurate (38.4 t actual vs 36-40 t
+	  estimated). The estimate now floors the landing reserve analytically:
+	  the propellant to null the unbraked descent speed the simulation
+	  records at 2km above the target, plus a 50 m/s margin, at the current
+	  mass - calibrated on flight 25 (343 m/s actual) and flight 29
+	  (409 m/s actual); the simulation's own figure is kept when larger
+	The return fuel hint no longer displays for vessels whose trajectory
+	  never lands (e.g. an orbiting payload): the estimate simulation
+	  times out there, and the ballistic miss it reported was a timeout
+	  artifact
+	Fixed the return fuel hint still reading optimistic on hot, flat
+	  returns (flight 30: hinted need ~1599 m/s vs ~2027 m/s actually
+	  flown). Two error sources fixed: the reentry/landing dV equivalent
+	  was evaluated at the CURRENT mass, but that propellant burns after
+	  the boostback at the post-boostback mass - 18.5t of landing fuel is
+	  360 m/s at the 174t enable mass yet 557 m/s at the 103t it actually
+	  burns at; the conversion now sequences the masses. And the boostback
+	  loss factor (|E|/T x margin) was 1.3, too low for fast downrange
+	  profiles where much of the burn goes into reversing downrange
+	  velocity - flight 29 needed 1.42, flight 30 (1170 m/s downrange at
+	  enable, 247km ballistic miss) needed 1.57; the margin now scales
+	  linearly with the horizontal speed at enable (1.3 + 2.33e-4 per m/s,
+	  clamped to 1.3-1.8, recovering 1.3 for slow/steep ascents).
+	  With both fixes flights 29 and 30 come out within +-5%
+	Fixed build.ps1 deploying nothing when invoked from outside the repo
+	  root (deploy.bat paths are repo-relative; the script claimed
+	  "Deployed" while xcopy copied 0 files)
+	Fixed the persisted velDamp=3.0 zombie from the crash-era build silently
+	  surviving in saves: the KSPField was renamed (landingBurnVelDamp ->
+	  landingBurnVelDampSec) so the old value is ignored and the safe
+	  default (0, disabled) applies - same trick as the aoaRampTopAlt rename
+	Fixed the return fuel hint estimate running once per BoosterGuidanceCore
+	  module per second: a multi-core vessel ran the full return simulation
+	  N times per second and logged N identical ReturnFuelHint lines per
+	  tick. Only the first module on the vessel runs it now
+	Fixed lateral drift during the forced-upright latch: pure-up steering
+	  has zero lateral authority, so once the latch engaged (horizontal
+	  speed below Upright Max Horiz Speed) any remaining drift ran unopposed
+	  (flight 25 hovered 33s at the wall, sliding sideways the whole time).
+	  The velocity-to-go correction now stays active during the latch,
+	  capped to 5 degrees of tilt to protect touchdown attitude
+	Reverted the forced-upright latch homing experiment (user request,
+	  after flights 32-34): the latch again commands a pure vertical
+	  attitude with no lateral correction. The homing either pumped the
+	  horizontal speed past the latch-release threshold (f32, 13-degree
+	  touchdown), or - speed-capped at 4 m/s - still touched down at 5-6
+	  degrees (f33/34): below ~60m the suicide burn is at full thrust and
+	  the attitude lags the rotating correction by ~50 degrees, so the
+	  lean bought tilt, not accuracy. Upright touchdown beats the offset
+	  it costs. (The non-control fixes of the same series - fuel hint
+	  dedup, boostback rocket-equation kg, velocity-scaled margin, velDamp
+	  rename - are kept)
+	Fixed the return fuel hint overestimating the boostback propellant by
+	  13-19% (flight 31: 74.5t hinted vs 65.7t actual; flight 32: 78.8t vs
+	  66.4t): the kg conversion was the linear M*dv/ve approximation, but
+	  the boostback is a large burn whose mass drops as it goes - it now
+	  uses the rocket equation. This also corrects the post-boostback mass
+	Fixed the landing burn igniting absurdly early on heavy, fast-descending
+	  boosters and burning ~2x the necessary propellant (flight 38: ignition
+	  at 36.6km, 83s burn, 96t where an aero-assisted burn from ~6km needs
+	  ~40t; flights 36/37 same pattern). CalculateLandingBurnHeight's
+	  criterion compared descent speed against a ROCKET-ONLY suicide profile
+	  and kept the highest crossing, ignoring that the atmosphere below
+	  scrubs speed for free. The criterion now credits the aero braking
+	  available below each point (discounted 30%) and takes the LOWEST safe
+	  ignition point, walked up from the ground of the no-burn profile.
+	  This also aligns the actual landing-burn cost with the return fuel
+	  hint, which already estimated the tight burn
+	  in the dV display (~50 m/s of padding removed from the landing share)
+	Fixed terminal overshoot past the target: the velocity-to-go law was
+	  commanding maximum braking but the 7-degree low-altitude AoA floor limited
+	  lateral authority to ~10 m/s^2 - not enough to kill the ~100 m/s the fast
+	  descent carries into the landing burn (flight 19, twice: overhead the
+	  target at 480m with 43 m/s, then drifted ~60-76m PAST while braking).
+	  The velocity law's correction budget was raised to 12 degrees (the
+	  impact-error law keeps the proven 7-degree floor). (The 6km mid-descent
+	  engagement of this law was later disabled after the flight-20 flyby -
+	  see above)
+	Fixed the return fuel hint always reading "need 0.0t": the estimate ran
+	  with steering enabled, so the simulation flew itself to the target and
+	  the ballistic miss (and thus the boostback share) came out near zero.
+	  The estimate simulation now runs with all steering budgets zeroed, and
+	  the diagnostic log line additionally records the ballistic miss, flight
+	  time and boostback delta-V so the estimate can be validated
+	Fixed flight log acceleration columns being written in world frame instead of the
+	  target-relative frame used by all other columns (made vertical thrust appear
+	  horizontal near the equator)
+	Fixed forced-upright terminal mode toggling at ~1Hz when horizontal speed hovered at
+	  the engage limit: each flip to vertical removed the retrograde lean so lateral drift
+	  regrew, shaking the vessel through the final 250m. The mode now latches with a
+	  3 m/s hysteresis band
+	Landing Burn Velocity Damping re-enabled in a safe form (it could be silently active
+	  on vessels saved by older builds): now applies only below 50 m/s horizontal speed
+	  and is capped at half the position error, so it brakes the terminal approach without
+	  ever reversing the homing direction
+	deploy.bat no longer references the author's private machine
+
+1.2.0.1
 	updated sample craft file:  Tundraf9
 	Updated version file to use github for new version info
 	Copied web page to README-WEB.md

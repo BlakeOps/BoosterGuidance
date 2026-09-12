@@ -70,6 +70,100 @@ namespace BoosterGuidance
       }
     }
 
+    // True pointing/thrust axis of the vessel: max-thrust-weighted average of
+    // engine thrust-transform axes. Neither vessel.transform.up (root part) nor
+    // ReferenceTransform.up (control point) is guaranteed to lie along the vessel
+    // for craft with a sideways root part (e.g. a radially-mounted decoupler as
+    // root), but the engines always push along their thrust transforms.
+    public static Vector3d GetThrustAxis(Vessel vessel, List<ModuleEngines> useEngines = null)
+    {
+      if (useEngines == null)
+        useEngines = GetAllEngines(vessel);
+      Vector3d axis = Vector3d.zero;
+      foreach (ModuleEngines engine in useEngines)
+      {
+        // weight by maxThrust so small aux engines (sepratrons etc.) don't skew the axis
+        double w = Math.Max(1e-3, engine.maxThrust);
+        foreach (Transform t in engine.thrustTransforms)
+          axis -= w * (Vector3d)t.forward; // thrust pushes the vessel along -forward
+      }
+      Transform vt = vessel.GetTransform();
+      if (axis.sqrMagnitude < 1e-6)
+        return (vt != null) ? (Vector3d)vt.up : (Vector3d)vessel.transform.up;
+      axis.Normalize();
+      // Sanity check against the transform getOffsetFromHeading steers by (proven
+      // to be the effective pointing axis in flight): if the engine axis points
+      // the opposite way, trust GetTransform instead
+      if ((vt != null) && (Vector3d.Dot(axis, vt.up) < 0))
+        axis = (Vector3d)vt.up;
+      return axis;
+    }
+
+    // Thrust-weighted average Isp (s) of the given engines (all operational engines
+    // if not specified), used to convert simulated thrust into propellant usage
+    public static double GetAverageIsp(Vessel vessel, List<ModuleEngines> useEngines = null)
+    {
+      if (useEngines == null)
+        useEngines = GetOperationalEngines(vessel);
+      double sumT = 0, sumToverI = 0; // Isp_avg = sum(T) / sum(T/Isp)
+      foreach (ModuleEngines engine in useEngines)
+      {
+        double mt = Math.Max(1e-3, engine.maxThrust);
+        double isp = (engine.realIsp > 0) ? engine.realIsp : 280; // same guess as GetEngineMinMaxThrust
+        sumT += mt;
+        sumToverI += mt / isp;
+      }
+      return (sumToverI > 0) ? sumT / sumToverI : 280;
+    }
+
+    // Propellant mass (kg) usable by the given engines (all operational engines if
+    // not specified), limited by the scarcest propellant of the mixture. IntakeAir
+    // and other free/flowless propellants are ignored.
+    public static double ComputeUsablePropellantKg(Vessel vessel, List<ModuleEngines> useEngines = null)
+    {
+      if (useEngines == null)
+        useEngines = GetOperationalEngines(vessel);
+      if (useEngines.Count == 0)
+        return 0;
+      // Mixture ratios from the first engine - assume all engines burn the same mix
+      ModuleEngines refEngine = useEngines[0];
+      double ratioSum = 0;
+      double minMixtureUnits = double.MaxValue;
+      foreach (Propellant prop in refEngine.propellants)
+      {
+        if ((prop.ratio <= 0) || (prop.name == "IntakeAir"))
+          continue;
+        PartResourceDefinition def = PartResourceLibrary.Instance.GetDefinition(prop.name);
+        if ((def == null) || (def.density <= 0))
+          continue;
+        double units = 0;
+        foreach (Part part in vessel.parts)
+        {
+          foreach (PartResource res in part.Resources)
+          {
+            if ((res.resourceName == prop.name) && (res.flowState))
+              units += res.amount;
+          }
+        }
+        ratioSum += prop.ratio;
+        minMixtureUnits = Math.Min(minMixtureUnits, units / prop.ratio);
+      }
+      if ((minMixtureUnits == double.MaxValue) || (ratioSum <= 0))
+        return 0;
+      // Mass of the full mixture at the limiting propellant's availability
+      double kg = 0;
+      foreach (Propellant prop in refEngine.propellants)
+      {
+        if ((prop.ratio <= 0) || (prop.name == "IntakeAir"))
+          continue;
+        PartResourceDefinition def = PartResourceLibrary.Instance.GetDefinition(prop.name);
+        if ((def == null) || (def.density <= 0))
+          continue;
+        kg += minMixtureUnits * prop.ratio * def.density * 1000; // density is t/unit
+      }
+      return kg;
+    }
+
     public static List<ModuleEngines> GetAllEngines(Vessel vessel)
     {
       List<ModuleEngines> engines = new List<ModuleEngines>();
@@ -206,6 +300,26 @@ namespace BoosterGuidance
     {
       vessel.ActionGroups.SetGroup(KSPActionGroup.Gear, true);
       return true;
+    }
+
+    // Last-resort backup (user request after flight 51): force-deploy every
+    // stowed stock parachute on the vessel. Callers gate on speed/altitude -
+    // stock chutes shred above ~300 m/s regardless
+    public static int DeployParachutes(Vessel vessel)
+    {
+      int n = 0;
+      foreach (Part p in vessel.parts)
+      {
+        foreach (ModuleParachute chute in p.FindModulesImplementing<ModuleParachute>())
+        {
+          if (chute.deploymentState == ModuleParachute.deploymentStates.STOWED)
+          {
+            chute.Deploy();
+            n++;
+          }
+        }
+      }
+      return n;
     }
   }
 }

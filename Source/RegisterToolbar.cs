@@ -19,11 +19,9 @@ namespace BoosterGuidance
 
         protected void Awake()
         {
-            Log = new KSP_Log.Log("BoosterGuidance"
-#if DEBUG
-                , KSP_Log.Log.LEVEL.INFO
-#endif
-                );
+            // Always log at INFO level: runtime messages (guidance enable/disable,
+            // logging start/stop) are the only way to diagnose user flight issues
+            Log = new KSP_Log.Log("BoosterGuidance", KSP_Log.Log.LEVEL.INFO);
         }
     }
 

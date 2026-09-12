@@ -158,6 +158,10 @@ namespace BoosterGuidance
       public static double impactAlt = 0d;
       private Color color = Color.red;
 
+      // f83 cleanup: the predicted trajectory LINE (deorbit scope) was
+      // deleted with the scope - the Trajectories trajectory line is the
+      // display now (it ends on the red cross, body-fixed)
+
       public Vector3? ImpactPosition { get; internal set; }
       public CelestialBody ImpactBody { get; internal set; }
       public Color Color { get; internal set; }
@@ -277,6 +281,11 @@ namespace BoosterGuidance
     {
       InitTargets();
       predictedCross.SetLatLonAlt(body, lat, lon, alt);
+      // MJ-style always-on: whoever computed a fresh prediction wants it
+      // visible, even with the BG window closed (flight 49: Hide() used to
+      // force-disable this, and node-dragging showed nothing until guidance
+      // was enabled)
+      predictedCross.enabled = true;
     }
   }
 }

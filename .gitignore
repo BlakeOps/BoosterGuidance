@@ -233,3 +233,17 @@ $RECYCLE.BIN/
 *.dll
 *.pdb
 .vs
+# AI tooling, analysis artifacts, and local-only content (never commit)
+.claude/
+.kimi-code/
+.opencode/
+openspec/
+docs/
+CONTEXT.md
+/*.dat
+
+# Build/test tooling: commit the scripts and harness sources, not binaries
+.tools/Microsoft.Net.Compilers.Toolset*/
+.tools/nuget.exe
+.tools/diag/*.exe
+.tools/diag/GameData/

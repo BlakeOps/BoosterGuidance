@@ -30,6 +30,12 @@ or in the map view set a vessel as the target and its location will be copied to
 
 - Set Here: Set the target to the current location
 
+- Landing sites: A library of named landing site presets shared across all your saves and vessels. Use ◄ ► to browse
+the presets for the current celestial body, Apply to set the target from the selected preset, type a name and Save to
+store the current target as a new preset, and Delete to remove a preset you created. Built-in presets (KSC launch pad
+and runway thresholds) cannot be deleted. Presets are stored in GameData/BoosterGuidance/PluginData/landing_sites.cfg
+and can be edited by hand if you wish
+
 - Target altitude: Altitude of the target!
 
 - Show targets: Toggle whether or not the target (yellow) and predicted landing point (red) are displayed in the flight and map view
@@ -124,6 +130,47 @@ The height to deploy the landing gear/legs if deploy landing gear is switched on
 
 Below a certain height we want to booster to at least make a soft landing even if in the wrong place. Below the height given the booster will no longer steer
 towards the target and will just try to make to reduce the horizontal velocity to zero and land vertically.
+
+### Upright height & upright max horizontal speed
+
+To avoid tipping over on touchdown the booster can force a pure vertical attitude at the end of the landing burn, no matter how far it
+still is from the target. Once below the upright height AND with horizontal speed below the upright max horizontal speed the booster
+stops correcting towards the target and just descends vertically. Below the upright height the maximum steering angle is also
+gradually reduced so the booster is already nearly vertical by the time it gets there. Set upright height to 0 to get the old
+behaviour back. The defaults (250m, 5 m/s) suit a Falcon-9 style booster on Kerbin.
+
+### Steer damping
+
+Steering corrections during the re-entry burn, aerodynamic descent and landing burn are automatically reduced in proportion to
+how fast the booster is already rotating sideways (its lateral angular rate). This rate damping suppresses the oscillation that
+could previously build up during the descent, without any manual gain tuning. The value is a time constant in seconds;
+the default of 1.0 works well for a typical Falcon-9 style booster. Set it to 0 to disable damping and get the old behaviour,
+or raise it (e.g. 1.5-2) if your booster still wobbles.
+
+### Starship recovery profile
+
+Each vessel can be switched between the default Falcon 9 profile and the Starship profile (belly flop + flip) with the
+Profile button at the top of the main window. The choice is saved per vessel. In Starship mode:
+
+- While guidance is disabled, the deorbit scope shows the predicted belly-flop impact point as a map cross with a
+  deviation readout, updated about once a second. It follows your first maneuver node (or the current orbit when no
+  node exists), so you can hand-tune a deorbit burn onto the target before committing.
+- Guidance can be enabled in any state: in a stable orbit it waits for your deorbit burn, after the burn it coasts
+  belly-first to the atmosphere, then flies the belly flop, flips to tail-down near the ground and lands with the
+  same suicide-burn logic as Falcon 9 boosters.
+- The belly axis defaults to the control point's forward direction; if your craft's flap/heat-shield side faces
+  another way, set the Belly roll offset once (90-degree quick steps plus a free angle).
+- The Correction gain slider scales the belly-flop steering live (0 = pure attitude hold with no impact correction,
+  useful to check whether your flaps can hold the belly-flop attitude at all before turning steering up).
+- The belly-flop steering is capped at 15 degrees of belly-normal tilt and fades out near the ground where the flip
+  takes over. The flip trigger is physical, not timed: fall distance during the rotation plus the aero-assisted
+  landing-burn height, clamped to 500-4000 m.
+- Time warp is managed: it is cut to 1x below the atmosphere interface (+10 km margin) and during all atmospheric
+  phases. Falcon 9 flights are unaffected.
+- If the craft cannot hold the commanded attitude (more than 20 degrees off for several seconds) you get a warning,
+  but guidance keeps flying so the flight log shows what the craft can actually do.
+
+Not yet: automatic deorbit, a fuel estimate for Starship, flip abort, and attitude-failure fallback.
 
 ### Touchdown margin
 

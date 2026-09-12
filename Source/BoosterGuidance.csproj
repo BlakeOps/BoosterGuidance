@@ -69,6 +69,13 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
+    <!-- Build-time only: provides .NET Framework 4.7.2 reference assemblies when no
+         Developer Pack / Visual Studio is installed (e.g. dotnet SDK builds) -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net472" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup>
     <Compile Include="AssemblyVersion.cs">
       <AutoGen>True</AutoGen>
       <DesignTime>True</DesignTime>
@@ -89,11 +96,14 @@
     <Compile Include="KSP\Trajectories\StockAeroUtil.cs" />
     <Compile Include="KSP\Trajectories\VesselAerodynamicModel.cs" />
     <Compile Include="KSP\KSPUtils.cs" />
+    <Compile Include="KSP\TrajAPI.cs" />
     <Compile Include="KSP\Trajectories\AeroDynamicModelFactory.cs" />
     <Compile Include="KSP\Trajectories\FARModel.cs" />
     <Compile Include="KSP\Trajectories\StockModel.cs" />
     <Compile Include="KSP\Trajectories\GLUtils.cs" />
     <Compile Include="KSP\BoosterGuidanceCore.cs" />
+    <Compile Include="KSP\LandingSites.cs" />
+    <Compile Include="KSP\StarshipAttitudeController.cs" />
     <Compile Include="KSP\Targets.cs" />
     <Compile Include="RegisterToolbar.cs" />
     <Compile Include="Utils.cs" />
