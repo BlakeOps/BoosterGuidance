@@ -29,7 +29,7 @@ namespace BoosterGuidance
         public double reentryBurnAlt = 55000;
 
         [KSPField(isPersistant = true, guiActive = false)]
-        public double reentryBurnTargetSpeed = 700;
+        public double reentryBurnTargetSpeed = 900; // f151: user-approved 900 trial (was 700); GUI box 0 still means 700
 
         [KSPField(isPersistant = true, guiActive = false)]
         public float reentryBurnSteerKp = 0.01f;
@@ -1818,8 +1818,11 @@ namespace BoosterGuidance
         // emergency key: it collided with the user's camera tool and fired
         // EmergencyLand mid-descent (f134) - the corner red button stays the
         // only emergency trigger. Active vessel only, and never while the
-        // user is typing in a text field (GUIUtility.keyboardControl)
-        private void PollHotkeys()
+        // user is typing in a text field (GUIUtility.keyboardControl).
+        // Public + called from MainWindow.Update (f151): this addon instance
+        // exists from flight-scene load, so the key no longer depends on the
+        // window ever having been opened
+        public void PollHotkeys()
         {
             if ((vessel == null) || (vessel != FlightGlobals.ActiveVessel))
                 return;
@@ -1841,8 +1844,13 @@ namespace BoosterGuidance
                     // when Trajectories has no computed trajectory (pad,
                     // pre-launch, mod absent)
                     LandingSite site = null;
+                    string pickReason = "none";
                     if (!string.IsNullOrEmpty(hotkeySiteName))
+                    {
                         site = LandingSites.Find(vessel.mainBody.name, hotkeySiteName);
+                        if (site != null)
+                            pickReason = "star";
+                    }
                     if (site == null)
                     {
                         double aimLat, aimLon;
@@ -1852,16 +1860,27 @@ namespace BoosterGuidance
                         {
                             double aimAlt;
                             vessel.mainBody.GetLatLonAlt(imp.Value + vessel.mainBody.position, out aimLat, out aimLon, out aimAlt);
+                            pickReason = "nearest-to-traj-impact(" + aimLat.ToString("F4") + "," + aimLon.ToString("F4") + ")";
                         }
                         else
                         {
                             aimLat = vessel.latitude;
                             aimLon = vessel.longitude;
+                            pickReason = "nearest-to-vessel";
                         }
                         site = LandingSites.Nearest(vessel.mainBody.name, aimLat, aimLon);
                     }
                     if (site != null)
                     {
+                        // f150: log the full decision - the user reported the
+                        // hotkey marker NOT sitting on the library point, but
+                        // static verification + both f149 flights (1.2 m /
+                        // 7.7 m at the library coords) found every layer
+                        // faithful. This line pins the next occurrence
+                        Log.Info("[Hotkey] target=" + site.name
+                            + " lat=" + site.lat.ToString("R") + " lon=" + site.lon.ToString("R") + " alt=" + site.alt.ToString("R")
+                            + " reason=" + pickReason
+                            + (string.IsNullOrEmpty(hotkeySiteName) ? "" : " starred=" + hotkeySiteName));
                         SetTarget(site.lat, site.lon, site.alt);
                         Targets.RedrawTarget(vessel.mainBody, site.lat, site.lon, site.alt);
                         GuiUtils.ScreenMessage(Localizer.Format("#BoosterGuidance_HotkeyTarget", site.name));
@@ -1893,7 +1912,9 @@ namespace BoosterGuidance
             }
             else
                 prevPhase = BLControllerPhase.Unset;
-            PollHotkeys();
+            // f151: hotkey polling moved to MainWindow.Update (always-loaded
+            // flight addon) - do NOT call PollHotkeys() here too, or the key
+            // is seen twice in the same frame and the toggle fires 2x
             // Starship warp police (design D10): rails warp stops physics, so
             // Fly never fires during warp - this must live in OnUpdate. Rails
             // warp is cut below the entry interface + 10 km margin and in the

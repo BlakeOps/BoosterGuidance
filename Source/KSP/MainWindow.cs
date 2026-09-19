@@ -127,6 +127,24 @@ namespace BoosterGuidance
 
         }
 
+        public void Update()
+        {
+            // Hotkey polling lives in this always-loaded flight addon rather
+            // than the PartModule (f151 user report: the key seemed dead until
+            // the window had been opened once). KSP instantiates this addon at
+            // flight-scene start, so the key now works whether or not the
+            // window has ever been shown. Still ignored while typing in a
+            // text field (checked again inside PollHotkeys)
+            if (GUIUtility.keyboardControl != 0)
+                return;
+            Vessel av = FlightGlobals.ActiveVessel;
+            if (av == null)
+                return;
+            BoosterGuidanceCore c = BoosterGuidanceCore.GetBoosterGuidanceCore(av);
+            if (c != null)
+                c.PollHotkeys();
+        }
+
         public void OnGUI()
         {
             if (!hidden)
@@ -762,7 +780,13 @@ namespace BoosterGuidance
 
                 GUILayout.BeginHorizontal();
                 GuiUtils.SimpleTextBox(Localizer.Format("#BoosterGuidance_HeavyBrakeDepth"), heavyBrakeDepthPct, "%", 40);
+                // f150 (user-approved 放宽到900): range widened to -50..100 so
+                // the target speed spans 900..300 m/s; 0 keeps the 700 m/s
+                // default. The resulting speed is shown so the entry is
+                // unambiguous
+                heavyBrakeDepthPct = Mathf.Clamp((int)heavyBrakeDepthPct, -50, 100);
                 core.reentryBurnTargetSpeed = 700 - 4 * (int)heavyBrakeDepthPct;
+                GUILayout.Label("-> " + (int)core.reentryBurnTargetSpeed + " m/s", GUILayout.Width(75));
                 GUILayout.EndHorizontal();
 
                 GUILayout.BeginHorizontal();
@@ -865,9 +889,9 @@ namespace BoosterGuidance
         public void UpdateFromCore()
         {
             reentryBurnAlt = (int)core.reentryBurnAlt;
-            heavyBrakeDepthPct = (int)Mathf.Clamp((700 - (int)core.reentryBurnTargetSpeed) / 4, 0, 100);
+            heavyBrakeDepthPct = (int)Mathf.Clamp((700 - (int)core.reentryBurnTargetSpeed) / 4, -50, 100);
             reentryBurnAlt = (int)core.reentryBurnAlt;
-            heavyBrakeDepthPct = (int)Mathf.Clamp((700 - (int)core.reentryBurnTargetSpeed) / 4, 0, 100);
+            heavyBrakeDepthPct = (int)Mathf.Clamp((700 - (int)core.reentryBurnTargetSpeed) / 4, -50, 100);
             tgtLatitude = core.tgtLatitude;
             tgtLongitude = core.tgtLongitude;
             tgtAlt = (int)core.tgtAlt;

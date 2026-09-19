@@ -34,7 +34,7 @@ namespace BoosterGuidance
         public double aeroDescentMaxAoA = 20;
         public double aeroDescentSteerKp = 0.001f;
         public double reentryBurnAlt = 70000;
-        public double reentryBurnTargetSpeed = 700;
+        public double reentryBurnTargetSpeed = 900; // f151: user-approved 900 trial (was 700); normally overwritten by the persisted core setting
         public double reentryBurnSteerKp = 0.001f;
         public double reentryBurnMaxAoA = 20;
         public double landingBurnHeight = 0; // Maximum altitude to enable powered descent
@@ -824,6 +824,7 @@ namespace BoosterGuidance
         // error and require growth to persist before giving up
         private double smError = -1;
         private double boostbackGrowTime = 0;
+        private double boostbackDoneTime = 0;
         private double logStartTime;
         private double logLastTime = 0;
         private Transform logTransform;
@@ -1071,6 +1072,7 @@ namespace BoosterGuidance
             minError = double.MaxValue; // reset so boostback doesn't give up
             smError = -1;
             boostbackGrowTime = 0;
+            boostbackDoneTime = 0;
             lowestY = KSPUtils.FindLowestPointOnVessel(vessel); // in case its changed
 
             // SetPhase(Unset) means "re-pick the phase from vessel state" at
@@ -2918,7 +2920,22 @@ namespace BoosterGuidance
                     boostbackGrowTime += dt;
                 else
                     boostbackGrowTime = 0;
-                if ((boostbackGrowTime > 1.0) || (targetError < 10))
+                // f151 (user-approved): cumulative done-timer with hysteresis.
+                // f151b showed the own-sim prediction is BISTABLE in the
+                // endgame - it flips between ~300 m and ~1.9 km every ~2 s
+                // (dragging a ~100 deg steer flip with it), so no
+                // continuous-hold threshold inside the flip amplitude can
+                // ever hold: the longest sub-1 km run was 1.50 s and the
+                // growth lottery ended the burn 45 s late. Accumulate below
+                // 1500 m, hold (no reset) in the 1500-3000 band, reset only
+                // above 3000; 2 s accumulated = converged (f151b replay: exit
+                // ~t=35 instead of t=81.7). The growth give-up stays as the
+                // diverging-burn backstop
+                if (targetError < 1500)
+                    boostbackDoneTime += dt;
+                else if (targetError > 3000)
+                    boostbackDoneTime = 0;
+                if ((boostbackGrowTime > 1.0) || (boostbackDoneTime > 2.0) || (targetError < 10))
                 {
                     phase = BLControllerPhase.Coasting;
                     msg = Localizer.Format("#BoosterGuidance_SwitchedToCoasting");
