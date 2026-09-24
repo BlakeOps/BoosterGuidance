@@ -29,7 +29,10 @@ namespace BoosterGuidance
         public double reentryBurnAlt = 55000;
 
         [KSPField(isPersistant = true, guiActive = false)]
-        public double reentryBurnTargetSpeed = 900; // f151: user-approved 900 trial (was 700); GUI box 0 still means 700
+        public double reentryBurnTargetSpeed = 900; // f151: user-approved 900 trial (was 700); GUI box 0 still means 700. f198: hard speed FLOOR for the mark-targeting brake
+
+        [KSPField(isPersistant = true, guiActive = false)]
+        public double reentryBurnMarkTarget = 800; // f198 (user-approved 动态红标刹车): brake until Trajectories' own red mark sits within this along-track error band (m). f205: default 4000 -> 800 per user directive
 
         [KSPField(isPersistant = true, guiActive = false)]
         public float reentryBurnSteerKp = 0.01f;
@@ -95,6 +98,31 @@ namespace BoosterGuidance
 
         [KSPField(isPersistant = true, guiActive = false)]
         public double aoaRampTopAlt = 15000;
+
+        // f178 方案B (user-ordered), f183 方案一 semantics: manual
+        // glide-angle test mode. While armed, AeroDescent pins the nose at
+        // manualGlideAoADeg off retrograde toward the UPRANGE HORIZON
+        // (canted base-first: 0 = retrograde, ~60 = nose level, 90 =
+        // broadside) and suspends the 方案C correction search, so the user
+        // can sweep angles and watch the red mark to find the hull's real
+        // glide angle
+        [KSPField(isPersistant = true, guiActive = false)]
+        public bool manualGlideAoA = false;
+
+        [KSPField(isPersistant = true, guiActive = false)]
+        public double manualGlideAoADeg = 20;
+
+        // f196 手动着陆姿态记录 (user: 我来操控几次着陆段的姿态调整,你记录
+        // 并分析学习): panel toggle. While armed in LandingBurn above the
+        // upright zone, a deflected stick hands all three attitude axes to
+        // the player's raw input (f104 semantics: center the stick = instant
+        // hand-back); the THROTTLE always stays with the guidance suicide
+        // law. Every tick is recorded to <ship>.manual.dat with what
+        // guidance wanted alongside what the player did. GUI button only,
+        // no hotkey (f134)
+        [KSPField(isPersistant = true, guiActive = false)]
+        public bool manualLandRecord = false;
+        private bool manualHandoverLogged = false;
 
         // Coast autowarp (MechJeb-style): physics-warp through the Coasting
         // phase (the long hands-off wait after boostback) and drop back to 1x
@@ -640,6 +668,7 @@ namespace BoosterGuidance
             other.reentryBurnMaxAoA = reentryBurnMaxAoA;
             other.reentryBurnSteerKp = reentryBurnSteerKp;
             other.reentryBurnTargetSpeed = reentryBurnTargetSpeed;
+            other.reentryBurnMarkTarget = reentryBurnMarkTarget;
             other.tgtAlt = tgtAlt;
             other.tgtLatitude = tgtLatitude;
             other.tgtSet = tgtSet;
@@ -654,6 +683,8 @@ namespace BoosterGuidance
             other.lowAoACap = lowAoACap;
             other.aoaRampLowAlt = aoaRampLowAlt;
             other.aoaRampTopAlt = aoaRampTopAlt;
+            other.manualGlideAoA = manualGlideAoA;
+            other.manualGlideAoADeg = manualGlideAoADeg;
             other.coastAutoWarp = coastAutoWarp;
             other.coastAutoWarpRate = coastAutoWarpRate;
             other.autoWarp = autoWarp;
@@ -764,7 +795,7 @@ namespace BoosterGuidance
         // guidance controller or the background return-fuel hint controller)
         private void ConfigureController(BLController c)
         {
-            c.InitReentryBurn(reentryBurnSteerKp, reentryBurnMaxAoA, reentryBurnAlt, reentryBurnTargetSpeed);
+            c.InitReentryBurn(reentryBurnSteerKp, reentryBurnMaxAoA, reentryBurnAlt, reentryBurnTargetSpeed, reentryBurnMarkTarget);
             c.InitAeroDescent(aeroDescentSteerKp, aeroDescentMaxAoA);
             c.InitLandingBurn(landingBurnSteerKp, landingBurnMaxAoA);
             c.SetTarget(tgtLatitude, tgtLongitude, tgtAlt);
@@ -778,6 +809,8 @@ namespace BoosterGuidance
             c.lowAoACap = lowAoACap;
             c.aoaRampLowAlt = aoaRampLowAlt;
             c.aoaRampTopAlt = aoaRampTopAlt;
+            c.manualGlideAoA = manualGlideAoA;
+            c.manualGlideAoADeg = manualGlideAoADeg;
             c.deployLandingGear = deployLandingGear;
             c.deployLandingGearHeight = deployLandingGearHeight;
             c.igniteDelay = igniteDelay;
@@ -1186,6 +1219,10 @@ namespace BoosterGuidance
             controller.trajCalBigTrim = starshipBigTrim; // GUI 高空大偏差反推 toggle -> controller, every tick (f97)
             controller.dvAvailable = dvAvailable; // f96 fuel watch -> controller: the big trim burn has a landing-reserve floor
             controller.landingReserveDv = landingReserveDv;
+            controller.manualLandRecord = manualLandRecord; // GUI 手动着陆姿态记录 toggle -> controller, every tick (f196)
+            controller.pilotAxisPitch = pilotPitch; // raw stick axes for the record rows
+            controller.pilotAxisYaw = pilotYaw;
+            controller.pilotAxisRoll = pilotRoll;
 
             KSPUtils.ComputeMinMaxThrust(vessel, out minThrust, out maxThrust);
 
@@ -1753,6 +1790,49 @@ namespace BoosterGuidance
                     lowAltManualStick = false;
                     lowAltManualStickLoggedPrev = false;
                 }
+            }
+
+            // f196 手动着陆姿态记录 (user: 我来操控几次着陆段的姿态调整,你
+            // 记录并分析学习). While the panel toggle is armed in LandingBurn
+            // above the upright zone (controller.manualLandActive), a
+            // DEFLECTED stick hands all three attitude axes to the player's
+            // raw input - f104 semantics: center the stick and guidance has
+            // the attitude back the same tick. The THROTTLE always stays
+            // with the guidance suicide law; guidance keeps computing
+            // underneath so the manual.dat rows carry what automation wanted
+            // next to what the player did. Below the upright zone the
+            // condition fails by itself = automatic hand-back for the
+            // touchdown. Arming also forces logging on (once) so the record
+            // file actually exists
+            if ((manualLandRecord) && (vessel == FlightGlobals.ActiveVessel))
+            {
+                if ((!Utils.LoggingActive) && (controller.phase == BLControllerPhase.LandingBurn))
+                {
+                    string fn = vessel.name.Replace(" ", "_").Replace("(", "").Replace(")", "");
+                    logFilename = fn;
+                    logging = true;
+                    StartLogging();
+                    Log.Info("[ManualLand] record armed with logging off - started logging as " + fn);
+                }
+                bool stickRec = (Math.Abs(pilotPitch) > 0.05f) || (Math.Abs(pilotYaw) > 0.05f) || (Math.Abs(pilotRoll) > 0.05f);
+                bool handover = controller.manualLandActive && stickRec;
+                controller.manualHandover = handover; // next tick's manual.dat man column
+                if (handover)
+                {
+                    state.pitch = pilotPitch;
+                    state.yaw = pilotYaw;
+                    state.roll = pilotRoll;
+                    if (vessel.Autopilot.Enabled)
+                        vessel.Autopilot.Disable(); // released: the LandingBurn block re-enables lazily
+                    if (!manualHandoverLogged)
+                    {
+                        manualHandoverLogged = true;
+                        Log.Info("[ManualLand] hand-over: player owns attitude, guidance keeps the throttle");
+                        GuiUtils.ScreenMessage("手动着陆姿态接管中 (程序保管油门; 回中摇杆即交还)");
+                    }
+                }
+                else
+                    manualHandoverLogged = false;
             }
         }
 

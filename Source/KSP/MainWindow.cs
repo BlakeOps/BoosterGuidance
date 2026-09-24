@@ -36,7 +36,15 @@ namespace BoosterGuidance
         float maxAeroDescentGain = 0.1f;
         float maxLandingBurnGain = 0.3f;
         float maxSteerAngle = 30; // 30 degrees
-        Rect windowRect = new Rect(150, 150, 250, 680);
+        // f205 (user: 面板太挤,下面的参数看不到): the Main tab alone grows
+        // well past 700px with the phase buttons + per-phase knobs, and a
+        // fixed-height GUILayout window simply clips the overflow - the
+        // bottom rows (landing-burn steer, engines) were unreachable. Each
+        // tab now scrolls inside the fixed window; width 250 -> 270 makes
+        // room for the scrollbar
+        Rect windowRect = new Rect(150, 150, 270, 680);
+        Vector2 scrollPosMain = Vector2.zero;
+        Vector2 scrollPosAdvanced = Vector2.zero;
 
         // Main GUI Elements
         bool showTargets = true;
@@ -62,6 +70,14 @@ namespace BoosterGuidance
         // descent + better accuracy. Maps to core.reentryBurnTargetSpeed:
         // 0% -> 700 m/s (legacy default), 50% -> 500, 100% -> 300
         EditableInt heavyBrakeDepthPct = 0;
+        // f198 (user-approved 动态红标刹车): brake until Trajectories' own
+        // red mark sits within this along-track error band. The brake-depth
+        // knob above is now the speed FLOOR (fuse), this box is the real
+        // target. f205 (user directive): default 4000 -> 800 - with the
+        // f200 pure-tau lead the exit rides the fresh usable mark, so a
+        // tighter band no longer chases the high-altitude refresh jitter
+        // the way the un-lead brake did
+        EditableInt reentryMarkTarget = 800;
         string numLandingBurnEngines = "current";
 
         // Advanced GUI Elements
@@ -74,6 +90,11 @@ namespace BoosterGuidance
         bool deployLandingGear = true;
         EditableInt deployLandingGearHeight = 500;
         EditableInt igniteDelay = 3; // Needed for RO
+        // f178 方案B: manual glide-angle test mode (see BoosterGuidanceCore)
+        bool manualGlideAoA = false;
+        EditableInt manualGlideAoADeg = 20;
+        // f196 手动着陆姿态记录 (see BoosterGuidanceCore)
+        bool manualLandRecord = false;
 
         // Targeting
         ITargetable lastVesselTarget = null;
@@ -369,6 +390,7 @@ namespace BoosterGuidance
             // Touchdown speed
             // No steer height
 
+            scrollPosAdvanced = GUILayout.BeginScrollView(scrollPosAdvanced, false, true);
             GUILayout.BeginHorizontal();
             deployLandingGear = GUILayout.Toggle(deployLandingGear, Localizer.Format("#BoosterGuidance_DeployGear"));
             GUILayout.EndHorizontal();
@@ -413,6 +435,24 @@ namespace BoosterGuidance
             Targets.showSteer = debug;
             GUILayout.EndHorizontal();
 
+            // f178 方案B: manual glide-angle test mode - while armed,
+            // AeroDescent flies this fixed pitch off retrograde and the red
+            // mark shows where that angle lands (correction search paused)
+            GUILayout.BeginHorizontal();
+            manualGlideAoA = GUILayout.Toggle(manualGlideAoA, "Manual glide AoA (glide test)");
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GuiUtils.SimpleTextBox("Manual glide AoA", manualGlideAoADeg, "deg", 65);
+            GUILayout.EndHorizontal();
+
+            // f196 手动着陆姿态记录: arm it, then in the landing burn a
+            // deflected stick takes the attitude (guidance keeps the
+            // throttle); every tick is recorded for offline analysis
+            GUILayout.BeginHorizontal();
+            manualLandRecord = GUILayout.Toggle(manualLandRecord, "手动着陆姿态记录 (着陆段摇杆接管,全程记录)");
+            GUILayout.EndHorizontal();
+
             // Show all active vessels
             GUILayout.Space(10);
             GUILayout.BeginHorizontal();
@@ -451,6 +491,7 @@ namespace BoosterGuidance
                 }
             }
 
+            GUILayout.EndScrollView();
             GUI.DragWindow();
             return GUI.changed;
         }
@@ -462,6 +503,7 @@ namespace BoosterGuidance
             BLControllerPhase phase = core.Phase();
             bool starship = core.recoveryProfile == "starship";
 
+            scrollPosMain = GUILayout.BeginScrollView(scrollPosMain, false, true);
             // Recovery profile (per-vessel, persisted; default falcon9).
             // Starship auto-picks its phases at enable, so the manual phase
             // buttons below are hidden for it
@@ -789,6 +831,23 @@ namespace BoosterGuidance
                 GUILayout.Label("-> " + (int)core.reentryBurnTargetSpeed + " m/s", GUILayout.Width(75));
                 GUILayout.EndHorizontal();
 
+                // f198 (user-approved 动态红标刹车): the real brake target is
+                // Trajectories' own red mark, not a speed - brake while the
+                // smoothed mark error is long beyond this band, cut when it
+                // enters the band or goes short. The speed above is only the
+                // floor fuse. Traj data absent -> legacy speed law
+                GUILayout.BeginHorizontal();
+                GuiUtils.SimpleTextBox("红标目标误差", reentryMarkTarget, "m", 60);
+                reentryMarkTarget = Mathf.Clamp((int)reentryMarkTarget, 500, 50000);
+                core.reentryBurnMarkTarget = (int)reentryMarkTarget;
+                GUILayout.EndHorizontal();
+                // f205: the "低于1500易追高空抖动" warning is gone - the f200
+                // pure-tau lead exit rides the fresh usable mark, so the old
+                // jitter-chase failure no longer applies at the 800 default
+                GUILayout.BeginHorizontal();
+                GUILayout.Label("刹到Traj红标进此误差带就收(偏近也收; 上面速度=红标失效时的保险丝)", GUILayout.Width(250));
+                GUILayout.EndHorizontal();
+
                 GUILayout.BeginHorizontal();
                 GUILayout.Label("Steer", GUILayout.Width(40));
                 core.reentryBurnSteerKp = Mathf.Clamp(core.reentryBurnSteerKp, 0, maxReentryGain);
@@ -865,6 +924,7 @@ namespace BoosterGuidance
                 GUILayout.EndHorizontal();
 
             }
+            GUILayout.EndScrollView();
             GUI.DragWindow();
             return (GUI.changed) || targetChanged;
         }
@@ -890,8 +950,7 @@ namespace BoosterGuidance
         {
             reentryBurnAlt = (int)core.reentryBurnAlt;
             heavyBrakeDepthPct = (int)Mathf.Clamp((700 - (int)core.reentryBurnTargetSpeed) / 4, -50, 100);
-            reentryBurnAlt = (int)core.reentryBurnAlt;
-            heavyBrakeDepthPct = (int)Mathf.Clamp((700 - (int)core.reentryBurnTargetSpeed) / 4, -50, 100);
+            reentryMarkTarget = (int)Mathf.Clamp((int)core.reentryBurnMarkTarget, 500, 50000);
             tgtLatitude = core.tgtLatitude;
             tgtLongitude = core.tgtLongitude;
             tgtAlt = (int)core.tgtAlt;
@@ -907,6 +966,9 @@ namespace BoosterGuidance
             steerDamping = core.steerDamping;
             deployLandingGear = core.deployLandingGear;
             deployLandingGearHeight = (int)core.deployLandingGearHeight;
+            manualGlideAoA = core.manualGlideAoA;
+            manualGlideAoADeg = (int)core.manualGlideAoADeg;
+            manualLandRecord = core.manualLandRecord;
             Targets.RedrawTarget(FlightGlobals.ActiveVessel.mainBody, tgtLatitude, tgtLongitude, tgtAlt);
 
             // Apply limits
@@ -937,6 +999,9 @@ namespace BoosterGuidance
             core.steerDamping = steerDamping;
             core.deployLandingGear = deployLandingGear;
             core.deployLandingGearHeight = deployLandingGearHeight;
+            core.manualGlideAoA = manualGlideAoA;
+            core.manualGlideAoADeg = Mathf.Clamp((int)manualGlideAoADeg, 0, 90);
+            core.manualLandRecord = manualLandRecord;
             core.Changed();
             Targets.RedrawTarget(FlightGlobals.ActiveVessel.mainBody, tgtLatitude, tgtLongitude, tgtAlt);
         }

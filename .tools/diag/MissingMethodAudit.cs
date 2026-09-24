@@ -53,6 +53,25 @@ class MissingMethodAudit
 
     static int Main(string[] args)
     {
+        // The runtime cannot print some loader exceptions (their ToString
+        // itself throws -> "Exception.ToString() failed" and no diagnostics).
+        // Report the crash through type name + HResult only, never ToString
+        try
+        {
+            return MainInner(args);
+        }
+        catch (Exception ex)
+        {
+            try { Console.WriteLine("AUDIT CRASH: " + ex.GetType().FullName + " hr=0x" + ex.HResult.ToString("X8")); }
+            catch { }
+            try { Console.WriteLine("msg: " + ex.Message); } catch { try { Console.WriteLine("msg: <unavailable>"); } catch { } }
+            try { Console.WriteLine(ex.StackTrace); } catch { }
+            return 2;
+        }
+    }
+
+    static int MainInner(string[] args)
+    {
         string bgDir = args.Length > 0 ? args[0] : @"E:\ksp_mod\BoosterGuidance\Source\bin\Release";
         string ksp = args.Length > 1 ? args[1] : @"D:\GamePlatform\Steam\steamapps\common\Kerbal Space Program";
         string managed = Path.Combine(ksp, @"KSP_x64_Data\Managed");
@@ -63,11 +82,18 @@ class MissingMethodAudit
             resolveDirs.Add(Path.GetDirectoryName(dll));
         AppDomain.CurrentDomain.AssemblyResolve += (s, e) =>
         {
-            string name = new AssemblyName(e.Name).Name + ".dll";
-            foreach (string dir in resolveDirs)
+            try
             {
-                string p = Path.Combine(dir, name);
-                if (File.Exists(p)) return Assembly.LoadFrom(p);
+                string name = new AssemblyName(e.Name).Name + ".dll";
+                foreach (string dir in resolveDirs)
+                {
+                    string p = Path.Combine(dir, name);
+                    if (File.Exists(p)) return Assembly.LoadFrom(p);
+                }
+            }
+            catch (Exception ex)
+            {
+                try { Console.WriteLine("resolve failed for " + e.Name + ": " + ex.GetType().FullName); } catch { }
             }
             return null;
         };
@@ -82,8 +108,23 @@ class MissingMethodAudit
         var icalls = new Dictionary<string, int>();
         var bclRefs = new HashSet<string>();
         int methods = 0, tokens = 0;
-        foreach (var type in asm.GetTypes())
+        Type[] types;
+        try
         {
+            types = asm.GetTypes();
+        }
+        catch (ReflectionTypeLoadException tle)
+        {
+            types = tle.Types;
+            foreach (var le in tle.LoaderExceptions)
+            {
+                if (le == null) continue;
+                try { Console.WriteLine("LOADER: " + le.GetType().FullName + ": " + le.Message); } catch { }
+            }
+        }
+        foreach (var type in types)
+        {
+            if (type == null) continue;
             foreach (var m in type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly))
             {
                 AuditMember(type, m, failures, icalls, bclRefs, ref methods, ref tokens);

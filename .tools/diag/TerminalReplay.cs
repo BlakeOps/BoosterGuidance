@@ -29,7 +29,10 @@ class TerminalReplay
 
     static Vector3d CallV2G(object ctl, MethodInfo mi, Vector3d posErr, Vector3d vel, Vector3d up, double y, double vy, double maxAoA)
     {
-        return (Vector3d)mi.Invoke(ctl, new object[] { posErr, vel, up, y, vy, maxAoA, new Vector3d(0, 0, 0) });
+        // f212: VelocityToGoCorrection gained 4 optional params (markShortHold,
+        // t, body, tgtR) - reflection Invoke needs the full count; the replay
+        // exercises the plain law so the mark-hold guard stays off
+        return (Vector3d)mi.Invoke(ctl, new object[] { posErr, vel, up, y, vy, maxAoA, new Vector3d(0, 0, 0), false, 0.0, null, null });
     }
 
     static int Main(string[] args)
@@ -60,7 +63,10 @@ class TerminalReplay
         AppDomain.CurrentDomain.AssemblyResolve += (s, e) =>
         {
             string name = new AssemblyName(e.Name).Name + ".dll";
-            foreach (string dir in new[] { bgDir, managed })
+            // f212: + the SpaceTuxLibrary Plugins dir - VelocityToGoCorrection's
+            // mark-hold guard calls Log.Info (KSP_Log.dll ships with
+            // GameData\SpaceTuxLibrary\Plugins, not Managed)
+            foreach (string dir in new[] { bgDir, managed, Path.GetFullPath(Path.Combine(managed, @"..\..\GameData\SpaceTuxLibrary\Plugins")) })
             {
                 string p = Path.Combine(dir, name);
                 if (File.Exists(p)) return Assembly.LoadFrom(p);
