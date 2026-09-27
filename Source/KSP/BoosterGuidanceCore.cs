@@ -29,10 +29,10 @@ namespace BoosterGuidance
         public double reentryBurnAlt = 55000;
 
         [KSPField(isPersistant = true, guiActive = false)]
-        public double reentryBurnTargetSpeed = 900; // f151: user-approved 900 trial (was 700); GUI box 0 still means 700. f198: hard speed FLOOR for the mark-targeting brake
+        public double reentryBurnTargetSpeed = 900; // f151: user-approved 900 trial (was 700); GUI box 0 still means 700. f217: back to a pure fallback fuse for the mark-targeting brake
 
         [KSPField(isPersistant = true, guiActive = false)]
-        public double reentryBurnMarkTarget = 800; // f198 (user-approved 动态红标刹车): brake until Trajectories' own red mark sits within this along-track error band (m). f205: default 4000 -> 800 per user directive
+        public double reentryBurnMarkTarget = 200; // f217 (user directive): brake until Trajectories' own red mark sits within this along-track error band (m)
 
         [KSPField(isPersistant = true, guiActive = false)]
         public float reentryBurnSteerKp = 0.01f;
@@ -1964,6 +1964,16 @@ namespace BoosterGuidance
                         SetTarget(site.lat, site.lon, site.alt);
                         Targets.RedrawTarget(vessel.mainBody, site.lat, site.lon, site.alt);
                         GuiUtils.ScreenMessage(Localizer.Format("#BoosterGuidance_HotkeyTarget", site.name));
+                    }
+                    // f217 (f215 移植, user directive 快捷键回收自动开启记录):
+                    // a hotkey recovery is always a flight we want the record
+                    // for - f214 flew with logging=False and left no
+                    // Actual.dat. EnableGuidance StartLogging()s when
+                    // logging is set
+                    if (!logging)
+                    {
+                        logging = true;
+                        Log.Info("[Hotkey] logging auto-enabled with hotkey recovery (f215/f217: 快捷键回收自动开启记录)");
                     }
                     EnableGuidance();
                 }

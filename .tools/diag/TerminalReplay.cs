@@ -7,7 +7,11 @@
 //            pumping, flight 22)
 //   [FIX]    the new law (v2gBrakeOnlyRadius=15) is strictly brake-only
 //            inside the radius (correction anti-parallel to vh)
-//   [REGR]   outside the radius the correction is unchanged
+//   [REGR]   outside the radius the correction matches the capped v2g law:
+//            identical to the old law when the f231 approach-speed cap does
+//            not bite, exactly vDes = vCap when it does
+//   [VCAP]   the f231 approach-speed cap actually engages on hot terminal
+//            rows of this dataset
 //   [TILT]   uncapped steer (retro-lean + old correction) exceeds 25 deg
 //            somewhere in the last 100m, and the lowTiltCap math bounds
 //            every capped command to <= 15 deg
@@ -29,10 +33,10 @@ class TerminalReplay
 
     static Vector3d CallV2G(object ctl, MethodInfo mi, Vector3d posErr, Vector3d vel, Vector3d up, double y, double vy, double maxAoA)
     {
-        // f212: VelocityToGoCorrection gained 4 optional params (markShortHold,
-        // t, body, tgtR) - reflection Invoke needs the full count; the replay
-        // exercises the plain law so the mark-hold guard stays off
-        return (Vector3d)mi.Invoke(ctl, new object[] { posErr, vel, up, y, vy, maxAoA, new Vector3d(0, 0, 0), false, 0.0, null, null });
+        // REVERT f216: back on the f196 (BC4B1E51) build - VelocityToGoCorrection
+        // is the plain 7-param law (posErr, vel_air, up, y, vy, maxAoA, omegaLat);
+        // the f212-f215 optional params (mark-hold/t/ownMarkErr/closingCap) are gone
+        return (Vector3d)mi.Invoke(ctl, new object[] { posErr, vel, up, y, vy, maxAoA, new Vector3d(0, 0, 0) });
     }
 
     static int Main(string[] args)
@@ -123,7 +127,7 @@ class TerminalReplay
         Vector3d up = new Vector3d(0, 1, 0);
         const double lowTiltCap = 15.0, lowTiltCapHeight = 100.0, v2gMaxAoA = 12.0;
 
-        int reproRows = 0, insideRows = 0, outsideRows = 0;
+        int reproRows = 0, insideRows = 0, outsideRows = 0, capBiteRows = 0;
         double maxTiltUncapped = 0, maxTiltCapped = 0, maxOutsideDiff = 0, worstBrakeCross = 0;
         string reproSample = "";
 
@@ -164,8 +168,24 @@ class TerminalReplay
             else
             {
                 outsideRows++;
-                // [REGR] outside the radius: identical correction
-                double diff = (corrNew - corrOld).magnitude;
+                // [REGR]+[VCAP] replicate the NEW law (f231 approach cap) in
+                // managed code and require an exact match: vDes = -posErr/tGo,
+                // capped to vCap = max(2, (posErr-brakeOnlyR)/tGo + 2) below
+                // v2gTermHeight, f113 uncoverable zero, V2gMaxSpeed clamp;
+                // corr = clamp((vDes - vh)*kp*deg2rad, maxAoA). When the cap
+                // does not bite this reduces to the OLD law byte-for-byte
+                double tGo = Math.Max(2, 2 * y / Math.Max(5, -vy));
+                double brakeR = Math.Max(15, y * 0.15); // ctlNew: v2gBrakeOnlyRadius=15, y<300
+                Vector3d vDesExp = (posErr.magnitude > brakeR) ? -posErr / tGo : Vector3d.zero;
+                double vCap = Math.Max(2, (posErr.magnitude - brakeR) / tGo + 2);
+                bool capBites = vDesExp.magnitude > vCap;
+                if (capBites) { capBiteRows++; vDesExp = Vector3d.Normalize(vDesExp) * vCap; }
+                if (posErr.magnitude > 25 * tGo) vDesExp = Vector3d.zero; // f113 falcon uncoverable
+                if (vDesExp.magnitude > 25) vDesExp = Vector3d.Normalize(vDesExp) * 25;
+                Vector3d corrExp = (vDesExp - vh) * (Math.PI / 180.0); // v2gKp=1, steerDamping=0
+                double maxCorr = v2gMaxAoA * Math.PI / 180.0;
+                if (corrExp.magnitude > maxCorr) corrExp = Vector3d.Normalize(corrExp) * maxCorr;
+                double diff = (corrNew - corrExp).magnitude;
                 if (diff > maxOutsideDiff) maxOutsideDiff = diff;
             }
 
@@ -191,7 +211,8 @@ class TerminalReplay
         Check(reproRows > 0, "bug reproduces: old law pumps toward-target inside 15m");
         Check(insideRows > 0, "replay actually covered the inside-15m zone");
         Check(worstBrakeCross < 1e-6, "FIX: new correction strictly brake-only inside 15m (worst cross=" + worstBrakeCross.ToString("E2") + ")");
-        Check(outsideRows > 0 && maxOutsideDiff < 1e-9, "REGR: outside 15m correction unchanged (rows=" + outsideRows + ", maxDiff=" + maxOutsideDiff.ToString("E2") + ")");
+        Check(outsideRows > 0 && maxOutsideDiff < 1e-8, "REGR: outside 15m correction matches the capped v2g law (rows=" + outsideRows + ", maxDiff=" + maxOutsideDiff.ToString("E2") + ")"); // 1e-8: managed replication vs DLL float noise (deg2rad constant, op order) - was 1e-9 when both sides ran the same DLL code
+        Check(capBiteRows > 0, "VCAP: f231 approach-speed cap engages on hot terminal rows (rows=" + capBiteRows + "/" + outsideRows + ")");
         Console.WriteLine(string.Format(CultureInfo.InvariantCulture, "[TILT]  max uncapped steer tilt = {0:F1} deg; max after 15deg cap = {1:F2} deg", maxTiltUncapped, maxTiltCapped));
         Check(maxTiltUncapped > 25, "bug reproduces: uncapped tilt exceeded 25 deg in last 120m");
         Check(maxTiltCapped <= 15.01, "FIX: capped steer tilt <= 15 deg below 100m");
