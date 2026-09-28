@@ -1005,8 +1005,6 @@ namespace BoosterGuidance
         private double landingBurnAMax = 100; // amax when landing burn alt computed (so we can recalc if needed)
         private bool setLandingEnginesDone = false;
         private bool noSteerReported = false;
-        private bool uprightReported = false;
-        private bool uprightLatched = false;
         private bool actualRowLogged = false;
         private string lastSettingsLine = "";
 
@@ -4163,47 +4161,31 @@ namespace BoosterGuidance
                         }
                     }
                 }
-                // Forced upright terminal attitude (also modeled in simulation via this shared path):
-                // once low and slow enough sideways, command pure vertical and accept the residual
-                // position error rather than touch down tilted and tip over.
-                // Latched with hysteresis: a plain threshold toggled the mode at ~1 Hz as
-                // horizontal speed hovered at the limit (flight 15, final 250 m) - each
-                // flip to upright removed the retrograde lean so the drift regrew, which
-                // flipped it back, shaking the vessel all the way down
+                // f237 (user-approved 2026-09-28 方案甲, SUPERSEDES the f236 方案B
+                // starship-only gate): the forced-upright latch is REMOVED for
+                // BOTH profiles. The latch became dangerous when the f213-era
+                // terminal v2g blend started commanding ~12deg tilts ahead of it:
+                // the snap to pure vertical swung the attitude under full burn
+                // and INJECTED vh 3.1->6.9 (f235), 0.6->7.3 (f236) and 0.1->6.5
+                // (f237 - a perfect d=11/vh=0.1 arrival at y=155 became a 32m
+                // drift and a 200t tip-over at vh=4.3), then commanded zero
+                // correction while the ship drifted. The modern terminal needs
+                // no latch: the below-noSteerHeight branches correct all the way
+                // to touchdown (brake-only inside 15m = stable azimuth, no
+                // f33/34 rotation pump) and the 15deg/100m lowTiltCap stays as
+                // the touchdown tilt safety. The maxAoA ramp below (near-
+                // vertical by noSteerHeight) is KEPT - it caps gently, no snap.
+                // Sim/real stay consistent: neither sees a latch now
                 double horizSpeed = Vector3d.Exclude(up, vel_air).magnitude;
-                if ((uprightHeight <= 0) || (yG >= uprightHeight))
-                    uprightLatched = false;
-                else if (horizSpeed < uprightMaxHorizSpeed)
-                    uprightLatched = true;
-                else if (horizSpeed > uprightMaxHorizSpeed + 3)
-                    uprightLatched = false;
-                bool forceUpright = (uprightHeight > 0) && (yG < uprightHeight) && uprightLatched;
-                if (forceUpright)
-                {
-                    // Pure vertical, no lateral correction: homing during the
-                    // latch was tried and reverted (flights 32-34) - the
-                    // correction either pumped the horizontal speed past the
-                    // latch-release threshold (f32, 13-degree touchdown) or,
-                    // speed-capped, could not kill the residual tangential
-                    // drift below ~60m anyway because the suicide burn is at
-                    // full thrust there and the attitude lags the rotating
-                    // correction by ~50 degrees (f33/34, 5-6 degree
-                    // touchdowns). Upright touchdown beats the offset it
-                    // costs: legs break from tilt, not from drift
-                    steer = up;
-                    if ((!uprightReported) && (!simulate))
-                    {
-                        msg = Localizer.Format("#BoosterGuidance_ForcedUpright");
-                        uprightReported = true;
-                    }
-                }
-                else if ((!simulate) && (yG > noSteerHeight))
+                if ((!simulate) && (yG > noSteerHeight))
                 {
                     double maxAoA = EffectiveMaxAoALB(landingBurnMaxAoA, yG);
                     if ((uprightHeight > 0) && (yG < uprightHeight))
                     {
-                        // Still too fast sideways to go fully upright: ramp the allowed angle
-                        // down as we descend so the booster is nearly vertical by noSteerHeight
+                        // f237 方案甲 (latch removed): this ramp is no longer the
+                        // latch's approach - it simply eases the allowed angle
+                        // down as we descend so the correction goes near-vertical
+                        // by noSteerHeight. A gentle cap, no snap
                         double frac = HGUtils.Clamp((yG - noSteerHeight) / Math.Max(1, uprightHeight - noSteerHeight), 0, 1);
                         maxAoA = 2 + frac * (maxAoA - 2);
                     }
@@ -4242,7 +4224,31 @@ namespace BoosterGuidance
                         // high-throttle segment (thrust beat aero at 60%+) do
                         // the translating
                         double translateAuth = HGUtils.Clamp((throttle - 0.35) / 0.25, 0, 1);
-                        steer = up + translateAuth * VelocityToGoCorrection(posErrS, vel_air, up, yG, vy, budgetS, omegaLat);
+                        Vector3d corrS = VelocityToGoCorrection(posErrS, vel_air, up, yG, vy, budgetS, omegaLat);
+                        // f236 (user-approved 2026-09-28 方案A2; user: 杀垂直速度
+                        // 的时候肯定不能把水平的位置也干扰了): cap the LATERAL
+                        // ACCELERATION the correction asks for, not just the angle.
+                        // A tilt demand at high throttle injects
+                        // aLat = throttle*amax*sin(tilt) sideways WHILE the
+                        // suicide burn is braking vertically - f236's catch ran
+                        // thr~0.87 with a 25.7deg command = ~15 m/s2 sideways
+                        // (vh pumped 10.9->16.4 through the final approach - the
+                        // f33/f34 half-pump mechanism). Cap corr so
+                        // throttle*amax*sin(|corr|) <= 3 m/s2 (the f33/34 pump
+                        // level, 1deg at full thrust - hull-independent): the
+                        // fuller the throttle, the smaller the allowed angle
+                        // (thr=0.9/amax=40 -> 4.8deg; thr=0.5 -> 8.6deg;
+                        // thr=0.3 -> 14.5deg), so vertical braking never
+                        // disturbs the horizontal fix. Same cap at the
+                        // y<=noSteerHeight starship call site below
+                        double aThrustNow = throttle * amax;
+                        if ((aThrustNow > 3) && (corrS.magnitude > 1e-9))
+                        {
+                            double allowedS = Math.Asin(HGUtils.Clamp(3 / aThrustNow, 0, 1));
+                            if (corrS.magnitude > allowedS)
+                                corrS = Vector3d.Normalize(corrS) * allowedS;
+                        }
+                        steer = up + translateAuth * corrS;
                         steerGain = v2gKp;
                     }
                     else
@@ -4510,7 +4516,24 @@ namespace BoosterGuidance
                         bool zxAlt = (yG <= V2gTermHeightEff);
                         bool zxAtt = (attErrPrevTick > 25);
                         bool zxProf = ((burnLatMode == 1) && (profileDemandLB >= 0.6)); // the suicide profile wants the engine back
-                        bool zoneExitM = zxDist || zxAlt || zxAtt || zxProf;
+                        // f236 (user-approved 2026-09-28 方案A): the profDem
+                        // crossover is a PROFILE artifact - a draggy ship falls
+                        // slower than the sqrt-y suicide profile the whole way
+                        // down, so demand only crosses 0.6 where the profile
+                        // meets terminal velocity (f236: engine handed back at
+                        // y=374 with vy=-205, ~180m BELOW the true suicide
+                        // height for that speed - the catch relied on drag,
+                        // total decel 68 vs the thrust's ~40 m/s2, vy still
+                        // -35 at y=9). Honest leg: the engine comes back when
+                        // the CURRENT speed needs it - ySuicideNeed is the
+                        // suicide-burn height for the present vy (same law as
+                        // SuicideBurnThrottle: v^2 = (1+sf)*av*y), exit at 1.1x
+                        // that need. Same sim/real structure as the other legs
+                        // (this whole mode machine is the real-flight branch;
+                        // the sim flies plain)
+                        double ySuicideNeed = (vy < 0) ? (vy * vy) / Math.Max(0.1, (1 + suicideFactor) * av) : 0;
+                        bool zxSuicide = (burnLatMode == 1) && (yG < 1.1 * ySuicideNeed);
+                        bool zoneExitM = zxDist || zxAlt || zxAtt || zxProf || zxSuicide;
                         int oldMode = burnLatMode;
                         if (zoneExitM)
                             burnLatMode = 0;
@@ -4594,7 +4617,7 @@ namespace BoosterGuidance
                             // leg and the cause had to be solved by
                             // elimination
                             if ((oldMode != 0) && (burnLatMode == 0))
-                                Log.Info(string.Format("[LandingBurn] lat-mode EXIT: mode={0} t={1:F1} y={2:F0} reason={3} (dist={4:F0} attErrPrev={5:F1} profDem={6:F2})", oldMode, t, yG, (zxDist) ? "dist<12" : ((zxAlt) ? "y<=v2gTerm" : ((zxAtt) ? "attErr>25" : ((zxProf) ? "profDem>=0.6" : "other"))), distM, attErrPrevTick, profileDemandLB)); // f220: the old final else lumped the case-2 dwell exit into "profDem>=0.6" (f220 t=315.2 logged profDem>=0.6 with profDem=0.01) - name the real legs
+                                Log.Info(string.Format("[LandingBurn] lat-mode EXIT: mode={0} t={1:F1} y={2:F0} reason={3} (dist={4:F0} attErrPrev={5:F1} profDem={6:F2} ySuicideNeed={7:F0})", oldMode, t, yG, (zxDist) ? "dist<12" : ((zxAlt) ? "y<=v2gTerm" : ((zxAtt) ? "attErr>25" : ((zxSuicide) ? "y<1.1*suicideNeed" : ((zxProf) ? "profDem>=0.6" : "other")))), distM, attErrPrevTick, profileDemandLB, ySuicideNeed)); // f220: the old final else lumped the case-2 dwell exit into "profDem>=0.6" (f220 t=315.2 logged profDem>=0.6 with profDem=0.01) - name the real legs; f236 方案A: zxSuicide named ahead of zxProf - when both are true on one tick the physical need is the honest reason
                         }
                     }
                     // AERO glide steer (保守砍层: the ladder/rungs/verdicts are
@@ -4715,6 +4738,26 @@ namespace BoosterGuidance
                     // BUY lateral authority; full authority here is the
                     // B01387E3-era law behind the 19m/9.6m brick records and
                     // the f120-135 light-ship precise era.
+                    // f237 方案乙 (user-approved 2026-09-28; the f236 方案A2 law
+                    // extended to the falcon terminal): cap the correction's
+                    // LATERAL ACCELERATION, throttle*amax*sin(|corr|) <= 3 m/s2.
+                    // f237's burn lit by the (correct) 方案A early handoff ran a
+                    // 26-30deg SATURATED PD correction whose azimuth spun a full
+                    // circle in ~4s - the thrust's ~26 m/s2 lateral swept vh
+                    // around (~125deg/s), the error followed, the correction
+                    // chased: a self-sustaining limit cycle (att_err 8-9deg for
+                    // 3s, user: 着陆点火晃得严重). At the cap (thr=0.85/amax=70
+                    // -> 2.9deg) the lateral force is 3 m/s2 and the spin cannot
+                    // sustain. The AERO glide corr is untouched (throttle=0 ->
+                    // no bind); ConeGuard works at low throttle where the cap
+                    // barely binds (thr*amax small -> allowed angle large)
+                    double aThrustF = throttle * amax;
+                    if ((aThrustF > 3) && (corr.magnitude > 1e-9))
+                    {
+                        double allowedF = Math.Asin(HGUtils.Clamp(3 / aThrustF, 0, 1));
+                        if (corr.magnitude > allowedF)
+                            corr = Vector3d.Normalize(corr) * allowedF;
+                    }
                     // Steer retrograde with added up component to damp oscillations at slow speed near ground
                     steer = -Vector3d.Normalize(vel_air - 20 * up) + corr;
                     }
@@ -4738,7 +4781,20 @@ namespace BoosterGuidance
                         // hand). 0.1 sits far below the floor's 0.30 - it
                         // only catches the engine-asleep coast
                         Vector3d posErr = Vector3d.Exclude(up, r - tgt_r);
-                        steer = up + HGUtils.Clamp(throttle / 0.1, 0, 1) * VelocityToGoCorrection(posErr, vel_air, up, yG, vy, Math.Max(EffectiveMaxAoALB(landingBurnMaxAoA, yG), V2gMaxAoAEff * TerminalAoAFade(yG)), omegaLat);
+                        Vector3d corrB = VelocityToGoCorrection(posErr, vel_air, up, yG, vy, Math.Max(EffectiveMaxAoALB(landingBurnMaxAoA, yG), V2gMaxAoAEff * TerminalAoAFade(yG)), omegaLat);
+                        // f236 方案A2 (same lateral-acceleration cap as the
+                        // y>noSteerHeight starship site above - this band is
+                        // where the deep suicide catch runs at near-full
+                        // throttle, so an uncapped angle here is exactly the
+                        // f236 pump): throttle*amax*sin(|corr|) <= 3 m/s2
+                        double aThrustB = throttle * amax;
+                        if ((aThrustB > 3) && (corrB.magnitude > 1e-9))
+                        {
+                            double allowedB = Math.Asin(HGUtils.Clamp(3 / aThrustB, 0, 1));
+                            if (corrB.magnitude > allowedB)
+                                corrB = Vector3d.Normalize(corrB) * allowedB;
+                        }
+                        steer = up + HGUtils.Clamp(throttle / 0.1, 0, 1) * corrB;
                         steerGain = v2gKp;
                     }
                     else
@@ -4761,7 +4817,22 @@ namespace BoosterGuidance
                         // thr>=0.1, faded to zero at 0; the vh-kill floor's
                         // 0.30 working point is untouched (f184 lesson)
                         Vector3d posErr = Vector3d.Exclude(up, r - tgt_r);
-                        steer += HGUtils.Clamp(throttle / 0.1, 0, 1) * VelocityToGoCorrection(posErr, vel_air, up, yG, vy, Math.Max(EffectiveMaxAoALB(landingBurnMaxAoA, yG), V2gMaxAoAEff * TerminalAoAFade(yG)), omegaLat);
+                        Vector3d corrF = VelocityToGoCorrection(posErr, vel_air, up, yG, vy, Math.Max(EffectiveMaxAoALB(landingBurnMaxAoA, yG), V2gMaxAoAEff * TerminalAoAFade(yG)), omegaLat);
+                        // f237 方案乙 (same lateral-acceleration cap as the
+                        // y>noSteerHeight falcon assembly above): with the
+                        // latch removed (方案甲) this branch corrects all the
+                        // way to touchdown, so its high-throttle tilt demand
+                        // gets the same throttle*amax*sin(|corr|) <= 3 m/s2
+                        // bound - vertical braking must not disturb the
+                        // horizontal fix
+                        double aThrustF2 = throttle * amax;
+                        if ((aThrustF2 > 3) && (corrF.magnitude > 1e-9))
+                        {
+                            double allowedF2 = Math.Asin(HGUtils.Clamp(3 / aThrustF2, 0, 1));
+                            if (corrF.magnitude > allowedF2)
+                                corrF = Vector3d.Normalize(corrF) * allowedF2;
+                        }
+                        steer += HGUtils.Clamp(throttle / 0.1, 0, 1) * corrF;
                     }
                     }
                 }

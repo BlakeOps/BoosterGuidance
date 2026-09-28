@@ -403,9 +403,6 @@ namespace BoosterGuidance
             GUILayout.EndHorizontal();
 
             GUILayout.BeginHorizontal();
-            GUILayout.EndHorizontal();
-
-            GUILayout.BeginHorizontal();
             GuiUtils.SimpleTextBox(Localizer.Format("#BoosterGuidance_TouchdownMargin"), touchdownMargin, "m", 65);
             GUILayout.EndHorizontal();
 
@@ -422,23 +419,12 @@ namespace BoosterGuidance
             Targets.showSteer = debug;
             GUILayout.EndHorizontal();
 
-            // f178 方案B: manual glide-angle test mode - while armed,
-            // AeroDescent flies this fixed pitch off retrograde and the red
-            // mark shows where that angle lands (correction search paused)
-            GUILayout.BeginHorizontal();
-            manualGlideAoA = GUILayout.Toggle(manualGlideAoA, "Manual glide AoA (glide test)");
-            GUILayout.EndHorizontal();
-
-            GUILayout.BeginHorizontal();
-            GuiUtils.SimpleTextBox("Manual glide AoA", manualGlideAoADeg, "deg", 65);
-            GUILayout.EndHorizontal();
-
-            // f196 手动着陆姿态记录: arm it, then in the landing burn a
-            // deflected stick takes the attitude (guidance keeps the
-            // throttle); every tick is recorded for offline analysis
-            GUILayout.BeginHorizontal();
-            manualLandRecord = GUILayout.Toggle(manualLandRecord, "手动着陆姿态记录 (着陆段摇杆接管,全程记录)");
-            GUILayout.EndHorizontal();
+            // f234/f235 UI cleanup (user-approved 2026-09-28): the f178 manual
+            // glide-AoA test rows and the f196 manual land-record toggle are
+            // OFF the panel - both were one-off experiment tools whose era is
+            // over. The core fields + persisted values are untouched (synced
+            // in UpdateFromCore/UpdateCore as before), so nothing changes in
+            // flight behavior; they can come back here if ever needed
 
             // Show all active vessels
             GUILayout.Space(10);
@@ -671,17 +657,6 @@ namespace BoosterGuidance
                     actionGroup--;
                 actionGroup = Math.Max(0, Math.Min(10, actionGroup));
                 GUILayout.EndHorizontal();
-                // Hotkey (user request 2026-09-12): guidance key = one-key
-                // starred-site target + enable/disable. No emergency key
-                // (camera-tool conflict, f134) - the corner red button is the
-                // only emergency trigger. KeyCode names (Backspace, Home, F10,
-                // KeypadPlus, ...), empty = unbound. Written straight to the
-                // persistent core field; the core re-parses on change
-                GUILayout.BeginHorizontal();
-                GUILayout.Label(Localizer.Format("#BoosterGuidance_HotkeyGuidance"));
-                hotkeyGuidance = GUILayout.TextField(hotkeyGuidance, GUILayout.Width(80));
-                core.hotkeyGuidance = hotkeyGuidance.Trim();
-                GUILayout.EndHorizontal();
                 GUILayout.BeginHorizontal();
                 GUILayout.Label("Max Offset Thrust Range (" + degreeRange.ToString("F0") + ":");
                 GUILayout.EndHorizontal();
@@ -689,6 +664,22 @@ namespace BoosterGuidance
                 degreeRange = GUILayout.HorizontalSlider(degreeRange, 0, 180f);
                 GUILayout.EndHorizontal();
                 }
+
+                // Hotkey (user request 2026-09-12): guidance key = one-key
+                // starred-site target + enable/disable. No emergency key
+                // (camera-tool conflict, f134) - the corner red button is the
+                // only emergency trigger. KeyCode names (Backspace, Home, F10,
+                // KeypadPlus, ...), empty = unbound. Written straight to the
+                // persistent core field; the core re-parses on change.
+                // f234/f235 UI cleanup (user-approved 2026-09-28): moved OUT of
+                // the falcon-only block - the one-key flow was built FOR the
+                // starship recovery, hiding it under the starship profile made
+                // the binding invisible/uneditable exactly where it is used
+                GUILayout.BeginHorizontal();
+                GUILayout.Label(Localizer.Format("#BoosterGuidance_HotkeyGuidance"));
+                hotkeyGuidance = GUILayout.TextField(hotkeyGuidance, GUILayout.Width(80));
+                core.hotkeyGuidance = hotkeyGuidance.Trim();
+                GUILayout.EndHorizontal();
 
                 // Info box
                 GUILayout.BeginHorizontal();
