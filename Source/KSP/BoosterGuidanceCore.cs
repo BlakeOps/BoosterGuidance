@@ -1302,10 +1302,26 @@ namespace BoosterGuidance
             if ((msg != "") && (vessel == FlightGlobals.ActiveVessel))
                 GuiUtils.ScreenMessage(msg);
 
-            if (vessel.checkLanded())
+            // f244 方案B (user-approved 2026-09-30, grafted onto the 4a48805
+            // base per user directive 2026-10-01): checkLanded() only scans
+            // part GROUND CONTACT (verified in the stock IL: it reads the
+            // Landed field, SPLASHED never enters) - a booster floating in
+            // the ocean never trips it and the engine burned forever.
+            // Splashed is the stock flag for that case
+            if (vessel.checkLanded() || vessel.Splashed)
             {
                 DisableGuidance();
                 state.mainThrottle = 0;
+                // f244 方案C (amended 2026-09-30, user directive): hand the
+                // ship to stock SAS + RCS after shutdown (DisableGuidance just
+                // disabled OUR autopilot and unhooked Fly, so no double-
+                // command). RADIAL-OUT, not StabilityAssist: SA holds the
+                // CURRENT attitude (a tilted hull stays tilted); RadialOut
+                // actively pulls the hull back to local vertical. RCS gives
+                // it the torque.
+                vessel.Autopilot.Enable(VesselAutopilot.AutopilotMode.RadialOut);
+                vessel.ActionGroups.SetGroup(KSPActionGroup.SAS, true);
+                vessel.ActionGroups.SetGroup(KSPActionGroup.RCS, true);
                 return;
             }
 
