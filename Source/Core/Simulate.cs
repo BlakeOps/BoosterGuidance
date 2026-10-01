@@ -223,6 +223,9 @@ namespace BoosterGuidance
             controller.simFuelReentryKg = 0;
             controller.simFuelLandingKg = 0;
             controller.simLowSpeed = -1;
+            controller.simLBEntryT = -1;   // 思路1: re-arm the LB-handover capture for this run
+            controller.simLBEntryVh = -1;
+            controller.simLBEntryRem = -1;
             double y = r.magnitude - body.Radius;
             // TODO: att should be supplied as vessel transform will be wrong in simulation
             // Use the ReferenceTransform (control point), matching what Fly passes for
@@ -292,6 +295,7 @@ namespace BoosterGuidance
                 Vector3d out_r;
                 Vector3d out_v;
                 // Compute time step change in r and v
+                BLControllerPhase preStepPhase = controller.phase; // 思路1: handover capture needs the pre-step phase
                 EulerStep(dt, vessel, r, v, att, totalMass, minThrust, maxThrust, aeroModel, body, T, controller, tgt_r, aeroFudgeFactor, out steer, out vel_air, out throttle, out out_r, out out_v);
 
                 if (throttle > 0)
@@ -303,6 +307,19 @@ namespace BoosterGuidance
                         controller.simFuelReentryKg += kg;
                     else if (controller.phase == BLControllerPhase.LandingBurn)
                         controller.simFuelLandingKg += kg;
+                }
+
+                // 思路1 (batch-2): capture the LandingBurn handover state at
+                // the in-sim phase transition. The live ReentryBurn prices
+                // its exit-speed ceiling off this (can the LB stop from what
+                // the current plan hands it - f266/f268's v*~850 exits were
+                // arithmetic death). Rem is finished in the compensated frame
+                // at the end of this run.
+                if ((controller.phase == BLControllerPhase.LandingBurn) && (preStepPhase != BLControllerPhase.LandingBurn) && (controller.simLBEntryT < 0))
+                {
+                    controller.simLBEntryT = T;
+                    controller.simLBEntryR = out_r;
+                    controller.simLBEntryVh = Vector3d.Exclude(Vector3d.Normalize(out_r), vel_air).magnitude;
                 }
 
                 y = r.magnitude - body.Radius;
@@ -361,6 +378,15 @@ namespace BoosterGuidance
                 ang = (float)((-(T + leadTime)) * body.angularVelocity.magnitude / Math.PI * 180.0);
             bodyRotation = Quaternion.AngleAxis(ang, body.angularVelocity.normalized);
             r = bodyRotation * r;
+            // 思路1: finish the handover capture - entry position rotated into
+            // the SAME compensated frame as the returned impact, then the
+            // horizontal room left to the target at that instant
+            if (controller.simLBEntryT >= 0)
+            {
+                Quaternion rotE = Quaternion.AngleAxis((float)((-(controller.simLBEntryT + leadTime)) * body.angularVelocity.magnitude / Math.PI * 180.0), body.angularVelocity.normalized);
+                Vector3d rE = rotE * controller.simLBEntryR;
+                controller.simLBEntryRem = Vector3d.Exclude(Vector3d.Normalize(rE), rE - tgt_r).magnitude;
+            }
             return r;
         }
 

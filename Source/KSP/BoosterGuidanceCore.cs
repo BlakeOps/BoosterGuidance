@@ -1302,7 +1302,7 @@ namespace BoosterGuidance
             if ((msg != "") && (vessel == FlightGlobals.ActiveVessel))
                 GuiUtils.ScreenMessage(msg);
 
-            // f244 方案B (user-approved 2026-09-30, grafted onto the 4a48805
+            // f244 方案B (user-approved 2026-09-30, grafted onto the d5eb0e7
             // base per user directive 2026-10-01): checkLanded() only scans
             // part GROUND CONTACT (verified in the stock IL: it reads the
             // Landed field, SPLASHED never enters) - a booster floating in
@@ -1988,8 +1988,16 @@ namespace BoosterGuidance
                     // logging is set
                     if (!logging)
                     {
+                        // f247 (user directive): name the record after the
+                        // VESSEL, same as the GUI path (MainWindow :624) -
+                        // otherwise logFilename stays "unset", every hotkey
+                        // recovery writes unset.Actual.dat, and the next
+                        // flight's StartLogging truncates the previous one
+                        // (f263's record was eaten by f264 exactly this way)
+                        string fn = vessel.name.Replace(" ", "_").Replace("(", "").Replace(")", "");
+                        logFilename = fn;
                         logging = true;
-                        Log.Info("[Hotkey] logging auto-enabled with hotkey recovery (f215/f217: 快捷键回收自动开启记录)");
+                        Log.Info("[Hotkey] logging auto-enabled with hotkey recovery as " + fn + " (f215/f217: 快捷键回收自动开启记录; f247: 按船名记录, unset 竞态修复)");
                     }
                     EnableGuidance();
                 }

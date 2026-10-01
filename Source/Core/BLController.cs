@@ -531,6 +531,35 @@ namespace BoosterGuidance
         private double rbVStar = 0;         // solved exit speed (m/s), EMA-smoothed
         private bool rbVStarValid = false;  // true once a solve has landed this burn
         private double lastRbVStarLogT = -1; // 5s rate limit on the OWN-SPEED solve line
+        // 思路1 (batch-2, user-approved 2026-10-01): downstream feasibility
+        // ceiling on the v* release. f266/f268 exited at v*~849 with the sim
+        // handing the landing burn 792-825 m/s over 494-3156 m of room =
+        // 108-635 m/s2 of stop demand vs the ~12 aLatFull can push - the exit
+        // was arithmetic death and the mark said so (along +24/+35 km LONG,
+        // markHit=0, vStarHit=1 parked it anyway). The main prediction sim
+        // flies the whole descent, so its LandingBurn-entry state answers
+        // "can the LB stop from what THIS plan hands it". simLBEntryVh/Rem
+        // are captured by Simulate.ToGround on the sim copy and harvested
+        // into rbLbVh/rbLbRem/rbLbT after each prediction run. While the
+        // captured handover is not stoppable (with a 3-fresh-read streak -
+        // f132: sim reads strobe in-burn), v* is pinned 10 m/s below the
+        // current speed = the vStarHit clause CANNOT release the burn alone.
+        // The stop demand may oversubscribe aLatFull up to 2x at handover
+        // (f269's proven-working point was 1.4x - the demand collapses
+        // quadratically as the kill bites); beyond that = keep burning.
+        // No capture at all (sim timeout / no LB in-sim) = streak never
+        // builds = v* never releases; the mark/floor exits carry that case
+        // (f198 v2). Copy ctor deliberately does NOT carry these (T5: sim
+        // copies must not inherit live-flight state).
+        public double simLBEntryVh = -1;  // sim's LandingBurn-entry horizontal speed (m/s), -1 = none this run
+        public double simLBEntryRem = -1; // sim's LandingBurn-entry horizontal room to target (m)
+        public double simLBEntryT = -1;   // sim-time of the capture (ToGround working var)
+        public Vector3d simLBEntryR = Vector3d.zero; // inertial body-rel position at the capture
+        private double rbLbVh = -1;       // harvested handover state (live side)
+        private double rbLbRem = -1;
+        private double rbLbT = -1;        // t of the last harvest (freshness gate, 8 s like the probes)
+        private int rbFeasStreak = 0;     // consecutive fresh feasible reads; >=3 lets v* release
+        public double rbFeasAveLat = 0;   // last computed aLatLB (diag/gate visibility)
         // f136 dual-prediction logging (user-picked option C): Trajectories'
         // own predicted impact is appended to every Actual.dat row (traj_x
         // traj_z, target-frame meters) so BG-sim vs Traj can be reconciled
@@ -884,10 +913,6 @@ namespace BoosterGuidance
         private double aeroCmdAng = 0;          // slew-limited aero command angle (deg)
         private double aPerDegWSm = -1;         // f229 方案四: smoothed measured aero gain (m/s^2/deg, -1 = unseeded)
         private double aPerDegASm = -1;         // f238 方案: AeroDescent adaptive cap's smoothed measured aero gain (m/s^2/deg, -1 = unseeded)
-        private double aeroReactSm = 0;         // f248 方案K': live-measured aero reaction opposing the walk-home (m/s^2, EMA 1.5s real clock)
-        private Vector3d lbReactPrevVelH = Vector3d.zero;
-        private double lbReactLastT = -1;
-        private bool lbReactInit = false;
         // f243 方案一: the AeroDescent demand consumes a CLEANED signal. The raw
         // 1 Hz own-sim prediction jumps +-50-100 m between runs (PlanJump); the
         // additive law saturates the corr cap for any |err| > ~10 m, so near
@@ -898,6 +923,16 @@ namespace BoosterGuidance
         // the prediction's own measured noise floor (not a fitted constant).
         private Vector3d aeroErrSm = Vector3d.zero;
         private bool aeroErrSmInit = false;
+        // 甲 (batch-2, user-approved 2026-10-01, f267 root): overshoot birth
+        // detector. An overshoot is born with the error VECTOR flipping 180
+        // deg against its own EMA, which sends the EMA through zero exactly
+        // when the demand should peak (f267: err=187 m while errSm=68). Flip
+        // (dot<0) + monotone magnitude growth, 3 consecutive ticks, above the
+        // deadband = self-certifying real signal (phantom jumps never grow
+        // monotonically) -> snap the EMA to the raw error, killing the
+        // zero-crossing lag at birth.
+        private int aeroOsStreak = 0;
+        private double aeroErrMagPrev = -1;
         private double predNoiseSm = -1;        // -1 = unseeded
         // f243 方案三 (user proposal): corr's zero baseline is the hull's
         // MEASURED retrograde attitude, not the idealized -velN. Seeded to
@@ -1633,21 +1668,8 @@ namespace BoosterGuidance
             // the horizontal speed - f111/f113 overshot the pad then crawled
             // back at 5-6 m/s THROUGH touchdown (near tip-over). Landing
             // stopped-but-short beats closer-but-moving. Falcon only.
-            // f243 方案二 (user-approved 2026-09-29): the REGION test must use
-            // the HONEST remaining time, not the floored tGo. The floored
-            // form (max(2s, 2y/max(5,|vy|))) reads 2-3 s in a slow terminal
-            // hover-descent, so the region collapsed to ~90-130 m and the
-            // rule PARKED ships that still had 9-12 s of descent left -
-            // f242 froze the last 143 m (landed 136 short), f243 froze the
-            // last 110 m from y=152 down. tGoHonest keeps only the f126
-            // divisor floor; the vDes division above keeps its own floor, so
-            // the flight-22 blow-up guard is untouched. The f22 reversal
-            // pump this rule was built against is independently bounded by
-            // the f237 乙 3 m/s2 lateral-accel cap at both falcon terminal
-            // assembly sites.
-            double tGoHonest = 2 * y / Math.Max(1, -vy);
             if ((recoveryProfile != "starship") && (y < v2gTermHeight)
-                && (posErr.magnitude > V2gMaxSpeedEff * tGoHonest))
+                && (posErr.magnitude > V2gMaxSpeedEff * tGo))
                 vDes = Vector3d.zero;
             if (vDes.magnitude > V2gMaxSpeedEff)
                 vDes = Vector3d.Normalize(vDes) * V2gMaxSpeedEff;
@@ -1693,6 +1715,18 @@ namespace BoosterGuidance
             double lowCap = Math.Max(lowAoACap, landingLowAoACap);
             double f = HGUtils.Clamp((y - aoaRampLowAlt) / Math.Max(1, aoaRampTopAlt - aoaRampLowAlt), 0, 1);
             return Math.Min(maxAoA, lowCap + (maxAoA - lowCap) * f);
+        }
+
+        // 思路1 verdict, factored pure for the RBExitReplay gate: is the
+        // sim-captured LandingBurn handover stoppable with aLatLB of lateral
+        // authority? stopRatio > 2 = arithmetic death (f266: 9.0, f268:
+        // 52.9); f269's proven-working handover sat at 1.42. lbVh<=0 = no
+        // capture = NOT feasible (no witness, no v* release).
+        public static bool ReentryHandoverFeasible(double lbVh, double lbRem, double aLatLB)
+        {
+            if ((lbVh <= 0) || (aLatLB <= 0)) return false;
+            double stopRatio = (lbVh * lbVh) / (2 * aLatLB * Math.Max(lbRem, 200));
+            return stopRatio <= 2.0;
         }
 
         // f193: side-force probe at a PARAMETERIZED AoA (the 15 deg probe
@@ -2137,9 +2171,6 @@ namespace BoosterGuidance
                 aeroLastT = -1;
                 aPerDegWSm = -1;
                 profileDemandLB = 0;
-                lbReactInit = false;   // f248 方案K': force-balance state is per-burn too
-                lbReactLastT = -1;
-                aeroReactSm = 0;
                 manualLandActive = false; // f196: the record hand-over lives only inside LandingBurn too
             }
             // f238 方案: same hygiene for the AeroDescent adaptive-cap state
@@ -2151,6 +2182,7 @@ namespace BoosterGuidance
                 // baseline reseed on every aero entry
                 aeroErrSmInit = false;
                 aeroTrimValid = false;
+                aeroOsStreak = 0; aeroErrMagPrev = -1; // 甲 hygiene
             }
             // Passive glide: no prediction sim at all - the attitude schedule
             // flies the pure aero brake and nothing consumes an impact error.
@@ -2190,6 +2222,11 @@ namespace BoosterGuidance
                 Vector3d newPred = Simulate.ToGround(tgtAlt, vessel, aeroModel, body, tc, tgt_r, out targetT, Utils.LogType.none, null, 0, PredictionMaxT());
                 landingBurnAMax = tc.landingBurnAMax;
                 landingBurnHeight = tc.landingBurnHeight; // Update from simulation
+                // 思路1: harvest the sim's LandingBurn handover state (the
+                // exit-speed ceiling's witness - see rbLbVh's field comment)
+                rbLbVh = tc.simLBEntryVh;
+                rbLbRem = tc.simLBEntryRem;
+                rbLbT = t;
                 // f186 revert: the AeroDescent glide-angle probe search
                 // (f178 方案C / f183 方案一) is REMOVED - structurally blind
                 // on hulls whose lift the sim does not model (f184: probes
@@ -3395,6 +3432,7 @@ namespace BoosterGuidance
                     rbDAlongInit = false;
                     rbBrakeDoneLogged = false;
                     rbVStarValid = false;
+                    rbFeasStreak = 0; // 思路1 hygiene: the streak must be re-earned each burn entry
                 }
                 rbMarkLastPhase = phase;
 
@@ -3509,6 +3547,22 @@ namespace BoosterGuidance
                     }
                 }
 
+                // 思路1 ceiling (batch-2): while the sim's LB handover is not
+                // stoppable, pin v* 10 m/s under the current speed so the
+                // vStarHit clause cannot release the burn (f266/f268 parked
+                // at v*=849 with +24/+35 km LONG marks). The pin trails the
+                // falling speed tick-by-tick, so it bites at ANY solved v*;
+                // the 250 floor keeps a deep chase from seeking a hover.
+                // Stale sim reads keep the last streak (sims strobe in-burn);
+                // no capture ever = streak 0 = mark/floor exits only.
+                double aLatLB = ((landingBurnAMax > 0) ? landingBurnAMax : amax)
+                              * Math.Sin(EffectiveMaxAoALB(landingBurnMaxAoA, Math.Max(1000, landingBurnHeight)) * deg2rad);
+                rbFeasAveLat = aLatLB;
+                if ((rbLbT >= 0) && (t - rbLbT < 8) && (rbLbVh > 0))
+                    rbFeasStreak = ReentryHandoverFeasible(rbLbVh, rbLbRem, aLatLB) ? (rbFeasStreak + 1) : 0;
+                if ((rbFeasStreak < 3) && rbVStarValid)
+                    rbVStar = Math.Min(rbVStar, Math.Max(250, vel_air.magnitude - 10));
+
                 // f198 v2 (user-approved after f199): the mark loop is
                 // self-limiting by physics - more brake = closer mark, so a
                 // fresh mark CANNOT keep lying long while you over-brake.
@@ -3557,9 +3611,27 @@ namespace BoosterGuidance
                         da = g + Math.Min(Math.Max(errv * 0.3, 10), 50); // legacy speed law: attempt to cancel 30% of extra velocity in 1 sec and min of 10m/s/s
                     double newThrottle = smooth * (da - amin) / (0.01 + amax - amin);
                     throttle = HGUtils.Clamp(newThrottle, minThrottle, 1);
+                    // f266 DIAG (batch-1, user directive 2026-10-01): f263's
+                    // ReentryBurn sat ~10 s at throttle 0 mid-burn (v ROSE
+                    // 1010->1032) with NO code path admitted by the static
+                    // read (burnDone would have logged brake-done + exited;
+                    // the da floor g+10 with amin~0.4 cannot produce
+                    // throttle 0 below 51km). Per-tick trace of the full
+                    // demand chain so the next strobe names its own path.
+                    // Real flight only; the burn is ~30-60 s.
+                    if (!simulate)
+                        Log.Info(string.Format("[ReentryBurn][DIAG] t={0:F1} y={1:F0} thr={2:F3} burnDone=0 v={3:F0} along={4:F0} pred={5:F0} dAlong={6:F1} fresh={7} vStar={8:F0}({9}) errv={10:F0} smooth={11:F2} da={12:F1} amin={13:F2} amax={14:F1} lbVh={15:F0} lbRem={16:F0} feas={17} aLatLB={18:F1}",
+                            t, yG, throttle, vel_air.magnitude, rbAlong, rbPred, rbDAlong, rbFresh ? 1 : 0, rbVStar, rbVStarValid ? 1 : 0, errv, smooth, da, amin, amax, rbLbVh, rbLbRem, rbFeasStreak, aLatLB));
                 }
                 else
                 {
+                    if (!simulate)
+                    {
+                        bool rbMarkHitNow = rbFresh && ((rbAlong <= reentryBurnMarkTarget) || (rbPred <= reentryBurnMarkTarget));
+                        bool rbVStarHitNow = rbVStarValid && (vel_air.magnitude <= rbVStar);
+                        Log.Info(string.Format("[ReentryBurn][DIAG] t={0:F1} y={1:F0} thr={2:F3} burnDone=1 v={3:F0} along={4:F0} pred={5:F0} dAlong={6:F1} fresh={7} vStar={8:F0}({9}) errv={10:F0} markHit={11} vStarHit={12} alignHold={13} feas={14}",
+                            t, yG, throttle, vel_air.magnitude, rbAlong, rbPred, rbDAlong, rbFresh ? 1 : 0, rbVStar, rbVStarValid ? 1 : 0, errv, rbMarkHitNow ? 1 : 0, rbVStarHitNow ? 1 : 0, alignHoldActive ? 1 : 0, rbFeasStreak));
+                    }
                     if ((!simulate) && (!rbBrakeDoneLogged))
                     {
                         rbBrakeDoneLogged = true;
@@ -3603,10 +3675,23 @@ namespace BoosterGuidance
 
                 if ((!simulate) && (!alignHoldActive))
                 {
+                    // batch-2 item 3 (user-approved 2026-10-01): the burn
+                    // correction consumes the EMA'd TRAJ MARK error when fresh,
+                    // not the own-sim `error` - f266/f268's along900 probe
+                    // swung +-7 km per refresh while burning (f196 burn-phase
+                    // phantom), swinging the burn attitude +-maxAoA every few
+                    // seconds = the user-seen 点火乱晃. rbMarkSmooth is smooth
+                    // in-burn by construction (DIAG: monotone decline, steady
+                    // dAlong). Same sign convention as error (impact-target).
+                    // att_err patch: the RB block never assigned attitudeError
+                    // before, so the .dat att_err column read 0.00 all burn =
+                    // unmeasured, right when the user saw the hull swinging.
+                    Vector3d rbErrSteer = (rbFresh) ? rbMarkSmooth : error;
                     pid_reentry.kp = reentryBurnSteerKp * CalculateSteerGain(throttle, vel_air, r, y, totalMass, false);
                     steerGain = pid_reentry.kp;
-                    double ang = pid_reentry.Update(error.magnitude, Time.deltaTime);
-                    steer = -Vector3d.Normalize(vel_air) + GetSteerCorrection(error, ang, EffectiveMaxAoA(reentryBurnMaxAoA, y), omegaLat);
+                    double ang = pid_reentry.Update(rbErrSteer.magnitude, Time.deltaTime);
+                    steer = -Vector3d.Normalize(vel_air) + GetSteerCorrection(rbErrSteer, ang, EffectiveMaxAoA(reentryBurnMaxAoA, y), omegaLat);
+                    attitudeError = HGUtils.angle_between(att, steer);
                 }
                 }
             }
@@ -3665,12 +3750,28 @@ namespace BoosterGuidance
                     // f243 方案一 (user-approved 2026-09-29): smooth the error
                     // VECTOR, subtract the MEASURED noise floor, demand zero
                     // inside it (see field comments at aeroErrSm/predNoiseSm).
+                    double aeroDeadband = (predNoiseSm > 0) ? HGUtils.Clamp(2.0 * predNoiseSm, 5, 200) : 5;
+                    // 甲 (batch-2): overshoot birth = vector flip vs the EMA +
+                    // monotone growth, 3 ticks, above the deadband -> snap the
+                    // EMA to raw (field comment at aeroOsStreak). Phantom jumps
+                    // never grow monotonically, so they cannot arm this.
+                    if (aeroErrSmInit)
+                    {
+                        bool osFlip = (Vector3d.Dot(error, aeroErrSm) < 0) && (error.magnitude > aeroDeadband);
+                        bool osGrow = (aeroErrMagPrev >= 0) && (error.magnitude > aeroErrMagPrev + 1);
+                        aeroOsStreak = (osFlip && osGrow) ? (aeroOsStreak + 1) : 0;
+                        if (aeroOsStreak >= 3)
+                        {
+                            aeroErrSm = error;
+                            aeroOsStreak = 0;
+                            Log.Info(string.Format("[AeroDescent] OS-SNAP t={0:F1} y={1:F0} err={2:F0} - overshoot flip certified, EMA resynced to raw", t, yG, error.magnitude));
+                        }
+                    }
+                    aeroErrMagPrev = error.magnitude;
                     if (!aeroErrSmInit) { aeroErrSm = error; aeroErrSmInit = true; }
                     else aeroErrSm += (error - aeroErrSm) * HGUtils.Clamp(dtLA / 3.0, 0, 1);
-                    double aeroDeadband = (predNoiseSm > 0) ? HGUtils.Clamp(2.0 * predNoiseSm, 5, 200) : 5;
                     double errSmMag = aeroErrSm.magnitude;
                     double demMag = Math.Max(0, errSmMag - aeroDeadband);
-                    double ang = pid_aero.Update(demMag, dt);
                     // f238 方案 (user-approved 2026-09-29): the angle cap is
                     // MEASURED, not scheduled. f238's 575t brick held the
                     // commanded 7-10deg for 62 s and the air bent the velocity
@@ -3719,10 +3820,27 @@ namespace BoosterGuidance
                     bool capMeasured = aPerDegASm > 0.001;
                     if (capMeasured)
                         angCapA = HGUtils.Clamp(7.0 * aPerDegASm / 0.15, 7, 25);
+                    // 丙 (batch-2, user-approved 2026-10-01, f267 root): the
+                    // PID's kp collapses with 1/q exactly when the late glide
+                    // needs the demand (f267: kp 14.4 -> 0.21). When measured
+                    // authority exists, price the angle directly: the accel
+                    // that removes demMag over a third of the remaining glide
+                    // (y/|vy| clock - f135), divided by the measured
+                    // per-degree side force. No measured authority -> the PID
+                    // fallback flies unchanged.
+                    double ang;
+                    if (capMeasured)
+                    {
+                        double tResp = HGUtils.Clamp(tGoA / 3, 5, 20);
+                        double aReq = 2.0 * demMag / (tResp * tResp);
+                        ang = aReq / aPerDegASm;
+                    }
+                    else
+                        ang = pid_aero.Update(demMag, dt);
                     if (t - lastAeroCapLogT > 5)
                     {
                         lastAeroCapLogT = t;
-                        Log.Info(string.Format("[AeroDescent] ADAPT CAP: t={0:F1} y={1:F0} err={2:F0} errSm={3:F0} db={4:F0} aPerDeg={5:F4} vDes={6:F1} tGo={7:F0} cap={8:F1}{9}", t, yG, error.magnitude, errSmMag, aeroDeadband, aPerDegASm, vDesA, tGoA, angCapA, capMeasured ? " (measured)" : " (static fallback)"));
+                        Log.Info(string.Format("[AeroDescent] ADAPT CAP: t={0:F1} y={1:F0} err={2:F0} errSm={3:F0} db={4:F0} aPerDeg={5:F4} vDes={6:F1} tGo={7:F0} cap={8:F1}{9} ang={10:F1} os={11}", t, yG, error.magnitude, errSmMag, aeroDeadband, aPerDegASm, vDesA, tGoA, angCapA, capMeasured ? " (measured)" : " (static fallback)", ang, aeroOsStreak));
                     }
                     // f243 方案三: steer = MEASURED retrograde baseline + corr
                     // (baseline learns the hull's real attitude while the
@@ -3787,21 +3905,7 @@ namespace BoosterGuidance
                 // (with a too-weak-thrust fallback) instead of the old
                 // once-per-enable SetActiveEngines here PLUS the per-tick
                 // core loop, so engines the user adds mid-burn stay lit
-                // f239 方案一' (user-approved 2026-09-29): derate av by the
-                // attitude tilt so the suicide PROFILE respects the tilted
-                // thrust authority. The throttle-side compensation (below,
-                // flight-12 era: throttle / cos(att.up)) guarantees the
-                // vertical component of what the law ASKS, but the plan
-                // itself assumed full vertical authority - its (1+sf)=1.9
-                // margin is only ~5%, and f239's ConeGuard-held 11-17deg
-                // tilt plus the err_dv relaxation ate exactly that, leaving
-                // ~2.5 m/s2 short of the true stop-need. With the derate
-                // the profile slows and the throttle rises earlier instead
-                // of discovering the shortfall at the ground. Also flows
-                // into 方案A's ySuicideNeed (4585): a tilted ship lights
-                // earlier - same physics, consistent. Floor 0.85 so a bad
-                // control-point reference can at most slow the plan 15%.
-                av = Math.Max(0.1, amax * Math.Max(0.85, Vector3d.Dot(att, up)) - g); // wrong on first iteration
+                av = Math.Max(0.1, amax - g); // wrong on first iteration
                 // f196: the manual record hand-over is live above the
                 // upright zone only - below it the law goes upright-only
                 // anyway, so the program owns the attitude again (auto
@@ -4016,42 +4120,6 @@ namespace BoosterGuidance
                             Vector3d tgtHK = Vector3d.Exclude(up, tgt_r - r);
                             double distHK = tgtHK.magnitude;
                             double remHK = (vhNow > 1) ? Vector3d.Dot(tgtHK, vhVecK / vhNow) : distHK;
-                            // f248 方案K' (user-approved 2026-09-30): live
-                            // force-balance measurement of the aero reaction
-                            // opposing the walk-home. The model cannot be
-                            // trusted (brick lift probe is 100-1000x fantasy),
-                            // but the reaction is SOLVABLE from telemetry
-                            // every tick: known thrust component along the
-                            // home axis minus the measured net acceleration
-                            // along it = the aero reaction. Engine off
-                            // (aThr=0) the net accel IS the aero force - the
-                            // drift prices itself. The reaction is a function
-                            // of AoA and q, NOT of throttle, so the demand
-                            // servo it feeds is feedforward - no loop through
-                            // the floor. EMA 1.5 s on the REAL clock (f206),
-                            // raw clamp +-15. Real flight only: sim state
-                            // must not mutate (f108)
-                            if ((!simulate) && (distHK > 1))
-                            {
-                                Vector3d homeDirK = tgtHK / distHK;
-                                double dtRK = (lbReactLastT < 0) ? 0.1 : Math.Min(0.5, t - lbReactLastT);
-                                lbReactLastT = t;
-                                if (!lbReactInit) { lbReactPrevVelH = vhVecK; lbReactInit = true; }
-                                else if (dtRK > 0)
-                                {
-                                    double aNetHomeK = Vector3d.Dot(vhVecK - lbReactPrevVelH, homeDirK) / dtRK;
-                                    // f249 L2: use the APPLIED throttle (last tick's
-                                    // final, post-floor value - maintained at method
-                                    // end). The pre-floor `throttle` here subtracts the
-                                    // floor's OWN correction from the force balance:
-                                    // f249 read -0.3 while the offline truth from the
-                                    // ax/az columns was +2.2 - self-blind, the
-                                    // feedforward never came (10 s park, 33->301 m)
-                                    double aThrHomeK = prevThrottleOut * amax * Vector3d.Dot(att, homeDirK);
-                                    lbReactPrevVelH = vhVecK;
-                                    aeroReactSm += (HGUtils.Clamp(aThrHomeK - aNetHomeK, -15, 15) - aeroReactSm) * HGUtils.Clamp(dtRK / 1.5, 0, 1);
-                                }
-                            }
                             // f135's descent-synced tau REVERTED per user
                             // order (退回前天稳定批次): fixed vhKillTau
                             // restored - the 200T brick's fast fall below the
@@ -4074,37 +4142,26 @@ namespace BoosterGuidance
                             // is always cheaper than re-buying it under
                             // thrust. Precise-era deliveries (<1km) give
                             // vNeed below the band solve = no change
-                            // f250 方案M: L1's honest-clock vNeed is SUPERSEDED by
-                            // the boundary pacing below - every vertical-clock form
-                            // is wrong somewhere on this profile (the dive is a
-                            // suicide deceleration = 2y/vy, the brick's mid-fall is
-                            // a CONSTANT terminal-velocity fall = y/vy; f249 kept
-                            // too much, f250 kept half and fell 722m short). vNeed
-                            // back to its f128 form, log/keep-role only
                             double vNeedHK = remHK / tBand;
                             double vhRes = HGUtils.Clamp(Math.Max((remHK - vhNow * tBand / 2) / (tBand / 2 + vhKillTau), vNeedHK), 0, Math.Max(vhKillResidCap, vNeedHK));
                             double aLatFull = amax * Math.Sin(EffectiveMaxAoALB(landingBurnMaxAoA, yG) * deg2rad);
-                            // f250 方案M (user: 刹车早了前偏严重 / 飞船完全有能力刹住
-                            // - approved 2026-09-30): STOP-FEASIBILITY BOUNDARY
-                            // pacing, distance-priced, NO vertical clock. vBoundary
-                            // is the fastest speed the honest lateral force can
-                            // still stop from inside the remaining gap:
-                            //   vh < vBoundary -> floor SILENT, keep the speed and
-                            //     cover the gap (f250's early brake + crawl die here:
-                            //     entry 351 < boundary 437, no brake at all);
-                            //   vh > vBoundary -> demand proportional to the excess
-                            //     over the boundary = ride it down, arrive at vh~0
-                            //     (f249's 61 m/s crossing dies here: the boundary
-                            //     forces a full-rate brake from rem~2400).
-                            // aLatNet subtracts the LIVE measured aero reaction
-                            // (L2 fixed the self-blind feedforward) = any hull,
-                            // any q, zero constants; f169 big-gap immunity by
-                            // construction (boundary ~800 at 13.4km, never fires).
-                            // Overshoot (rem<=0) still always enters - the slam/K'
-                            // branch below owns it unchanged.
-                            double aLatNetM = Math.Max(1, aLatFull - Math.Max(0, aeroReactSm));
-                            double vhBoundM = Math.Sqrt(2 * aLatNetM * Math.Max(remHK, 25));
-                            if ((vhNow > vhBoundM) || (remHK <= 0))
+                            // 方案R R1 (user-approved 2026-10-01, f256 root: the
+                            // boundary-as-TRIGGER stays silent while the stop
+                            // "fits" (vh < bound), but NOTHING rides the stop
+                            // curve - the suicide law coasted |a|=0.7 through
+                            // the dive's room collapse and the hull crossed
+                            // dist-min at vh=97.5 -> 352m LONG, f254/f255 same
+                            // family): the floor demand now ALWAYS rides the
+                            // f130 proportional exact-stop rate, the natural
+                            // upper bound of safe braking (stops AT the target,
+                            // never before - cannot 前偏). The f131/f132
+                            // deadband below is the only silencer - long range
+                            // reads tiny (f169 immunity by arithmetic: rem=
+                            // 13.4km, vh=115 -> aReq=0.5 < 1.5, silent).
+                            // Overshoot (rem<=0) unchanged - slam owns it.
+                            // Flight-proven f258: crossing vh 344->18.2 vs
+                            // f256's 97.5. (vNeedHK/vhRes kept log-only.)
+                            if ((vhNow > 0) || (remHK <= 0))
                             {
                                 // f130 (heavy CRASH, user: 高空乱点火落不下去燃料耗尽):
                         // the 999 "brake as hard as the cap allows" branch was
@@ -4134,14 +4191,13 @@ namespace BoosterGuidance
                         // stop-in-gap even while the residual law said
                         // keep flying). (vhNow > vhRes above keeps the
                         // numerator positive)
-                        double aLatStop = (vhNow * vhNow - vhBoundM * vhBoundM) / (2 * Math.Max(remHK, 25));
-                                // f250 方案M: demand = the boundary excess only -
-                                // the old linear shed term (vhNow-vhRes)/tBand
-                                // priced the shed on the 7.4s constant-vy clock
-                                // and spent 210 m/s at max rate = the f250 early
-                                // brake (722m SHORT). Proportional at the
-                                // boundary, degenerates to full brake (aLatFull
-                                // cap downstream) when genuinely late
+                        // 方案R R1: closing-case demand = exact-stop, ALWAYS
+                        // (the f130 proportional stop law restored - 方案M's
+                        // boundary-excess form only paid once the ride no
+                        // longer fit, which is exactly when the dive leaves
+                        // no room to use it). remHK>0 here by the gate above;
+                        // rem<=0 is overwritten by the overshoot branch below
+                        double aLatStop = vhNow * vhNow / (2 * Math.Max(remHK, 25));
                                 double aLatReq = aLatStop;
                                 // f219 (user: 过冲就全力把水平速度立马减掉,
                                 // 不要再缓动油门了): rem<=0 (overflown) the
@@ -4228,44 +4284,6 @@ namespace BoosterGuidance
                                 bool slamCutHK = (vhNow < 5) || (vy >= -15) || ((!simulate) && (vhNow <= 40));
                                 if (overshotHK)
                                     aLatReq = (((!simulate) && overshootGlide) || slamCutHK) ? 0 : aLatFull;
-                                // f248 方案K' (user-approved 2026-09-30,
-                                // SUPERSEDES f247 方案H): the fixed 3 m/s2
-                                // priced the floor UNDER the weathervane
-                                // reaction for this hull at this q - f248
-                                // measured it directly: thrust-lat 3.8 vs
-                                // reaction 3.0-3.7 -> net ~0, vh pinned at
-                                // 33 for the whole 10 s transit, 34->439 m
-                                // (f192 parity-crossover root, fourth bite).
-                                // The demand is now COMPUTED, never fitted:
-                                // the f130 proportional stop law (live
-                                // geometry - stop the escape before the
-                                // distance doubles; decays with vEsc so the
-                                // finish is proportional = no slam ping-pong,
-                                // no f220 regulation) plus the LIVE measured
-                                // aero reaction (the force balance above -
-                                // any hull, any AoA, any q, no vessel
-                                // constants). Capped at aLatFull downstream =
-                                // degenerates to the f219 slam when genuinely
-                                // needed. Same guards as before (vh 5-40,
-                                // falling fast, real flight); the AERO
-                                // engine-off cut still wins when the glide
-                                // owns the steer
-                                double aStopK = 0;
-                                if ((!simulate) && overshotHK && (vhNow >= 5) && (vhNow <= 40) && (vy < -15))
-                                {
-                                    double vEscK = (distHK > 1) ? Math.Max(0, -Vector3d.Dot(vhVecK, tgtHK / distHK)) : vhNow;
-                                    // f249 L3 (user: 着陆段之前必须刹完): the
-                                    // dist-only stop law has no clock - f249
-                                    // parked 10 s at vEsc=25 (stop=2.0) while the
-                                    // ground arrived in 7 s. Deadline term: the
-                                    // escape must die inside the REAL remaining
-                                    // time (y/vy is exact for a terminal-velocity
-                                    // brick, conservative for a decelerating
-                                    // hull, floored per f126)
-                                    double tGoK = yG / Math.Max(1, -vy);
-                                    aStopK = Math.Max(vEscK * vEscK / (2 * Math.Max(distHK, 50)), vEscK / tGoK);
-                                    aLatReq = aStopK + HGUtils.Clamp(aeroReactSm, 0, 15);
-                                }
                                 // f131 (user: 精度好但有点废燃料 - picked 方案A
                                 // 死区): small demands (0.1-2.5) are residuals the
                                 // terminal v2g absorbs free under the final burn's
@@ -4309,9 +4327,9 @@ namespace BoosterGuidance
                                     {
                                         lastVhKillLogT = t;
                                         if (overshotHK)
-                                            Log.Info(string.Format("[LandingBurn] vh-kill {6}: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} -> thr={5:F2} (aReq={7:F1} stop={8:F1} aero={9:F1} - {10})", vhNow, vy, yG, distHK, remHK, throttle, (vhNow <= 40) ? "LAT-FLOOR" : "SLAM", aLatReq, aStopK, aeroReactSm, (vhNow <= 40) ? "overshoot lat-authority floor, f248 方案K' live force-balance" : "overshoot FULL brake, f219 - 过冲全力杀, no more gentle pacing"));
+                                            Log.Info(string.Format("[LandingBurn] vh-kill SLAM: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} -> thr={5:F2} (overshoot FULL brake, f219 - 过冲全力杀, no more gentle pacing)", vhNow, vy, yG, distHK, remHK, throttle));
                                         else
-                                            Log.Info(string.Format("[LandingBurn] vh-kill floor: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} res={5:F0} bound={6:F0} aStop={7:F1} aLatReq={8:F1}/{9:F1} -> thr={10:F2} (boundary-paced horizontal kill, f250 方案M stop-feasibility, no vertical clock; vNeed={12:F0} log-only)", vhNow, vy, yG, distHK, remHK, vhRes, vhBoundM, aLatStop, aLatReq, aLatFull, throttle, aoaRampLowAlt, vNeedHK));
+                                            Log.Info(string.Format("[LandingBurn] vh-kill floor: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} res={5:F0} tBand={6:F1}s aStop={7:F1} aLatReq={8:F1}/{9:F1} -> thr={10:F2} (exact-stop horizontal kill, 方案R R1 restored - always rides the stop curve; f170 vNeed={12:F0} log-only, res log-only)", vhNow, vy, yG, distHK, remHK, vhRes, tBand, aLatStop, aLatReq, aLatFull, throttle, aoaRampLowAlt, vNeedHK));
                                     }
                                 }
                                 }
@@ -4720,13 +4738,7 @@ namespace BoosterGuidance
                         // ~177m still carrying 50-56 m/s of approach = the
                         // overshoot seed (the vh-kill deep-kill slam + hover
                         // that follows is downstream of THIS let-go)
-                        // f247 方案I (user-approved 2026-09-30): never release
-                        // while FLEEING. f247's release read closing=-36
-                        // (receding at 37 m/s) as "slow" because -36 < 8, and
-                        // dist=83 (>80 by 3 m) waived the vh check - the guard
-                        // let go mid-escape and handed the walk-back to a
-                        // min-throttle law (83 -> 451 m). Fleeing is not slow.
-                        else if ((coneGuard) && (closing > -2) && ((closing < cgRelClosing) || ((aNeed < 0.4 * aLat) && (distH > 80) && (closing < 10))) && ((vhH < cgRelVh) || (distH > 80)))
+                        else if ((coneGuard) && ((closing < cgRelClosing) || ((aNeed < 0.4 * aLat) && (distH > 80) && (closing < 10))) && ((vhH < cgRelVh) || (distH > 80)))
                         {
                             coneGuard = false;
                             Log.Info(string.Format("[ConeGuard] OFF t={0:F1} alt={1:F0} dist={2:F0} closing={3:F0} vh={4:F0} rel={5:F1}/{6:F1}", t, y, distH, closing, vhH, cgRelClosing, cgRelVh));
@@ -4767,16 +4779,12 @@ namespace BoosterGuidance
                         // normal approach machine. The member flag is what
                         // silences the vh-kill floor above (it runs earlier
                         // in the tick)
-                        // f246 方案F (user-approved 2026-09-30): the overshoot
-                        // glide takeover is DELETED. It fired on NOISE-level
-                        // closing (0.2 -> -2.3 m/s at dist=42, tGo>10 by the
-                        // deep-fall clock) and parked the ship at min throttle
-                        // for 7 s - free-fall 660 m, glide tilt pointing AWAY,
-                        // dist 42->65 (f246(2)); f245(2) blew 21->116 the same
-                        // way. Iron rule: the handoff IS the failure surface.
-                        // Overshoots go back to the single v2g law (the error
-                        // vector carries the sign - it walks back by itself).
-                        bool overshootGlideM = false;
+                        // 保守砍层: the vh cap is a FIXED 40 (the f223 12 /
+                        // f224 15 hysteresis is deleted with the ladder) -
+                        // the glide owns every slow AND mid-speed overshoot;
+                        // only genuinely fast crossings (vh>40, the f219/
+                        // f223-era slam design case) go back to the engine
+                        bool overshootGlideM = zoneEnterM && (tGoM > 10) && (closingM <= 0) && (vhM <= 40);
                         overshootGlide = overshootGlideM;
                         // 保守砍层: honestDrift is DELETED with the ladder
                         // give-up it depended on - a slow overshoot is simply
@@ -5033,21 +5041,10 @@ namespace BoosterGuidance
                     // 3s, user: 着陆点火晃得严重). At the cap (thr=0.85/amax=70
                     // -> 2.9deg) the lateral force is 3 m/s2 and the spin cannot
                     // sustain. The AERO glide corr is untouched (throttle=0 ->
-                    // no bind).
-                    // f239 方案三 (user-approved 2026-09-29): ConeGuard is
-                    // EXEMPT from the cap. The old comment claimed the cap
-                    // "barely binds" ConeGuard - f238/f239 disproved it
-                    // (ConeGuard works at thr 0.7-1.0): under the cap f239's
-                    // ConeGuard walked 3186->106m, and 106m is exactly the
-                    // distance at which it struck an unmodeled structure.
-                    // ConeGuard is the full-budget v2g takeover for a dive
-                    // that will overshoot the pad - strangling its walk
-                    // defeats its single purpose, and its corr is the same
-                    // variable the cap clamps, so the exemption must be
-                    // explicit. The f237 limit cycle the cap exists to kill
-                    // came from the PD/v2g assembly, which stays capped.
+                    // no bind); ConeGuard works at low throttle where the cap
+                    // barely binds (thr*amax small -> allowed angle large)
                     double aThrustF = throttle * amax;
-                    if ((aThrustF > 3) && (corr.magnitude > 1e-9) && (!coneGuard))
+                    if ((aThrustF > 3) && (corr.magnitude > 1e-9))
                     {
                         double allowedF = Math.Asin(HGUtils.Clamp(3 / aThrustF, 0, 1));
                         if (corr.magnitude > allowedF)
