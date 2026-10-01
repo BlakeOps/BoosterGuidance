@@ -955,6 +955,10 @@ namespace BoosterGuidance
         private Vector3d v2gDbgErr = Vector3d.zero;
         private Vector3d v2gDbgDamp = Vector3d.zero;
         private double v2gDbgAoA = 0;
+        // 批次三 item 5: v2g law's live demand |vDes-vh|/tGo (m/s2), stashed
+        // every VelocityToGoCorrection call - the corr-floor's demand price
+        private double v2gDmdALat = 0;
+        private double lastCorrFloorLogT = -999;
         private double lastV2gDbgT = -100;
         // f92 coast-translation floor: the suicide law manages VERTICAL speed
         // only, so the mid-burn coast (vy under the profile -> throttle ~0)
@@ -1630,7 +1634,7 @@ namespace BoosterGuidance
         private double V2gMaxAoAEff { get { return (recoveryProfile == "starship") ? Math.Max(v2gMaxAoA, 18) : v2gMaxAoA; } }
         private double V2gMaxSpeedEff { get { return (recoveryProfile == "starship") ? Math.Max(v2gMaxSpeed, 45) : v2gMaxSpeed; } }
 
-        private Vector3d VelocityToGoCorrection(Vector3d posErr, Vector3d vel_air, Vector3d up, double y, double vy, double maxAoA, Vector3d omegaLat)
+        private Vector3d VelocityToGoCorrection(Vector3d posErr, Vector3d vel_air, Vector3d up, double y, double vy, double maxAoA, Vector3d omegaLat, double amax)
         {
             double tGo = Math.Max(2, 2 * y / Math.Max(5, -vy));
             // Brake-only when nearly on target: a v_des reversal at full
@@ -1662,6 +1666,26 @@ namespace BoosterGuidance
                 if (vDes.magnitude > vCap)
                     vDes = Vector3d.Normalize(vDes) * vCap;
             }
+            // 方案U (user-approved 批次三 2026-10-02, f270/f273 末端追击倾角
+            // 触地=倾倒炸, user: 倾倒=坠毁落点再好也作废 - 宁正勿准): terminal
+            // correct-and-stop feasibility. Inside the terminal zone, when
+            // the remaining offset CANNOT be covered in the remaining time
+            // even at the delivered lateral-accel cap (bang-bang price
+            // aLat*tGo^2/2), stop chasing: vDes=0 kills vh only = land
+            // stopped-but-short instead of closer-but-moving-tilted.
+            // aLatTerm = min(amax*sin(maxAoA), 3) - the 3 is the f237
+            // delivered lateral-accel cap already flown, no new constant.
+            // f270 replay: gives up at y<=75 (dist 24 > 6) instead of
+            // building vh 1.9->6.3 into the pad; healthy slow terminals
+            // (vy small -> tGo long -> threshold huge) never trigger.
+            // Extends the f113 falcon-only law below to all hulls with a
+            // physics price replacing V2gMaxSpeedEff*tGo.
+            if ((y < v2gTermHeight) && (y > 0))
+            {
+                double aLatTerm = Math.Min(amax * Math.Sin(maxAoA * deg2rad), 3);
+                if (posErr.magnitude > aLatTerm * tGo * tGo / 2)
+                    vDes = Vector3d.zero;
+            }
             // f113 terminal brake-only (user-approved 方案C): in the terminal
             // zone, when the remaining time-to-ground cannot cover the offset
             // even at full correction speed, stop translating and just kill
@@ -1680,6 +1704,10 @@ namespace BoosterGuidance
             v2gDbgErr = tgtErrV2g * v2gKp * deg2rad;
             v2gDbgDamp = -steerDamping * omegaLat;
             v2gDbgAoA = maxAoA;
+            // 批次三 item 5: the law's own demand price |vDes-vh|/tGo (m/s2),
+            // read by the corr-floor in the LB floor block - when 方案U above
+            // zeroes vDes this collapses to vh/tGo (braking-only demand)
+            v2gDmdALat = tgtErrV2g.magnitude / tGo;
             return GetSteerCorrection(tgtErrV2g, v2gKp, maxAoA, omegaLat);
         }
 
@@ -4334,6 +4362,35 @@ namespace BoosterGuidance
                                 }
                                 }
                             }
+                            // 批次三 item 5 (user-approved 2026-10-02, f271
+                            // 末端: y=464 suicide law 油门掉到 0.01, v2g 还
+                            // 有 23 m/s 修正需求被饿死 -> 过顶后 145->185m
+                            // 走表): while the v2g law has a live correction
+                            // demand in the terminal zone, floor the throttle
+                            // at the demand's own price (aLatNeed/aLatFull)
+                            // so a suicide-law coast dip cannot starve the
+                            // correction. Capped by the f130/f92 anti-hover
+                            // form 0.85*g/amax - can never hover; the suicide
+                            // law takes back over the moment it wants more
+                            // (max-composition only), and the AERO-mode
+                            // engine cut below still overrides (铁律: 着陆段
+                            // 气动调整时刻禁止点火). Deadband reuses the
+                            // f131/f132 1.5 m/s2 split, no new constants.
+                            // Sim gets the same floor = sim flies what the
+                            // ship flies.
+                            if ((yG < V2gTermHeightEff) && (v2gDmdALat >= vhKillDeadband))
+                            {
+                                double corrFloor = Math.Min(v2gDmdALat / Math.Max(0.1, aLatFull), 0.85 * g / Math.Max(1, amax));
+                                if (throttle < corrFloor)
+                                {
+                                    throttle = corrFloor;
+                                    if ((!simulate) && (t - lastCorrFloorLogT > 5))
+                                    {
+                                        lastCorrFloorLogT = t;
+                                        Log.Info(string.Format("[LandingBurn] corr-floor: y={0:F0} vh={1:F1} aNeed={2:F1}/{3:F1} -> thr={4:F2} (v2g demand anti-starve, 批次三 item5)", yG, vhNow, v2gDmdALat, aLatFull, throttle));
+                                    }
+                                }
+                            }
                             // f193 综合方案 v3 (user-approved, SUPERSEDES the
                             // f191 fixed probe): lateral mode machine -
                             // THRUST-mode throttle floor + AERO-mode engine
@@ -4516,7 +4573,7 @@ namespace BoosterGuidance
                         // high-throttle segment (thrust beat aero at 60%+) do
                         // the translating
                         double translateAuth = HGUtils.Clamp((throttle - 0.35) / 0.25, 0, 1);
-                        Vector3d corrS = VelocityToGoCorrection(posErrS, vel_air, up, yG, vy, budgetS, omegaLat);
+                        Vector3d corrS = VelocityToGoCorrection(posErrS, vel_air, up, yG, vy, budgetS, omegaLat, amax);
                         // f236 (user-approved 2026-09-28 方案A2; user: 杀垂直速度
                         // 的时候肯定不能把水平的位置也干扰了): cap the LATERAL
                         // ACCELERATION the correction asks for, not just the angle.
@@ -4664,7 +4721,7 @@ namespace BoosterGuidance
                     {
                         double v2gBudget = maxAoA + w * Math.Max(0, v2gMaxAoA - maxAoA);
                         Vector3d posErr = Vector3d.Exclude(up, r - tgt_r);
-                        corr = (1 - w) * corr + w * VelocityToGoCorrection(posErr, vel_air, up, yG, vy, v2gBudget, omegaLat);
+                        corr = (1 - w) * corr + w * VelocityToGoCorrection(posErr, vel_air, up, yG, vy, v2gBudget, omegaLat, amax);
                     }
                     // Early terminal handoff (v2gTermHeight, default 300m):
                     // blend the velocity braking in above noSteerHeight so
@@ -4680,7 +4737,7 @@ namespace BoosterGuidance
                     {
                         double v2gBudgetT = Math.Max(maxAoA, V2gMaxAoAEff * TerminalAoAFade(yG));
                         Vector3d posErr = Vector3d.Exclude(up, r - tgt_r);
-                        corr = (1 - wt) * corr + wt * VelocityToGoCorrection(posErr, vel_air, up, yG, vy, v2gBudgetT, omegaLat);
+                        corr = (1 - wt) * corr + wt * VelocityToGoCorrection(posErr, vel_air, up, yG, vy, v2gBudgetT, omegaLat, amax);
                     }
                     // f113 cone guard (user-approved f111 方案A): a fast dive
                     // AT the pad crosses overhead still carrying the
@@ -4744,7 +4801,7 @@ namespace BoosterGuidance
                             Log.Info(string.Format("[ConeGuard] OFF t={0:F1} alt={1:F0} dist={2:F0} closing={3:F0} vh={4:F0} rel={5:F1}/{6:F1}", t, y, distH, closing, vhH, cgRelClosing, cgRelVh));
                         }
                         if (coneGuard)
-                            corr = VelocityToGoCorrection(posErrH, vel_air, up, yG, vy, maxAoA, omegaLat);
+                            corr = VelocityToGoCorrection(posErrH, vel_air, up, yG, vy, maxAoA, omegaLat, amax);
                     }
                     // 保守砍层 (f230+f231, user-approved 保守砍): the lateral
                     // stack is cut to a THREE-ZONE structure. High dive:
@@ -5073,7 +5130,7 @@ namespace BoosterGuidance
                         // hand). 0.1 sits far below the floor's 0.30 - it
                         // only catches the engine-asleep coast
                         Vector3d posErr = Vector3d.Exclude(up, r - tgt_r);
-                        Vector3d corrB = VelocityToGoCorrection(posErr, vel_air, up, yG, vy, Math.Max(EffectiveMaxAoALB(landingBurnMaxAoA, yG), V2gMaxAoAEff * TerminalAoAFade(yG)), omegaLat);
+                        Vector3d corrB = VelocityToGoCorrection(posErr, vel_air, up, yG, vy, Math.Max(EffectiveMaxAoALB(landingBurnMaxAoA, yG), V2gMaxAoAEff * TerminalAoAFade(yG)), omegaLat, amax);
                         // f236 方案A2 (same lateral-acceleration cap as the
                         // y>noSteerHeight starship site above - this band is
                         // where the deep suicide catch runs at near-full
@@ -5109,7 +5166,7 @@ namespace BoosterGuidance
                         // thr>=0.1, faded to zero at 0; the vh-kill floor's
                         // 0.30 working point is untouched (f184 lesson)
                         Vector3d posErr = Vector3d.Exclude(up, r - tgt_r);
-                        Vector3d corrF = VelocityToGoCorrection(posErr, vel_air, up, yG, vy, Math.Max(EffectiveMaxAoALB(landingBurnMaxAoA, yG), V2gMaxAoAEff * TerminalAoAFade(yG)), omegaLat);
+                        Vector3d corrF = VelocityToGoCorrection(posErr, vel_air, up, yG, vy, Math.Max(EffectiveMaxAoALB(landingBurnMaxAoA, yG), V2gMaxAoAEff * TerminalAoAFade(yG)), omegaLat, amax);
                         // f237 方案乙 (same lateral-acceleration cap as the
                         // y>noSteerHeight falcon assembly above): with the
                         // latch removed (方案甲) this branch corrects all the
