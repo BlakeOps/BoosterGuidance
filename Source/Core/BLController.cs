@@ -959,6 +959,30 @@ namespace BoosterGuidance
         // every VelocityToGoCorrection call - the corr-floor's demand price
         private double v2gDmdALat = 0;
         private double lastCorrFloorLogT = -999;
+        // 批次四 方案X′ (user-approved 2026-10-02, f272 4187m前偏): the
+        // vh-kill floor's legacy authority model aLatFull=amax*sin(knob)
+        // prices ONLY the tilt channel, but the heavy brake delivers
+        // horizontal decel through the retrograde thrust GEOMETRY plus
+        // aero (f272 Actual.dat: at LB entry the thrust accel was 39.8
+        // horizontal / 30 vertical of amax 49.8 = ~53 deg tilt, measured
+        // total horizontal decel 30-40 m/s2 vs the priced 8.6) - the
+        // floor pinned thr=1.0 and drove the mark THROUGH the target
+        // (+1162 LONG -> -3650 SHORT), then parked at min throttle with
+        // 5.2km of reach left = 4187m short. Ratio closure: the throttle
+        // that PRODUCED the measured decel, scaled by demand/measured,
+        // delivers the demand - model-free, source-agnostic (thrust
+        // geometry AND aero both inside the measurement), fixed point at
+        // exactly aero+thr*k=aLatReq. (The additive aero-subtraction
+        // form was considered and rejected on the f272 data: with the
+        // burn 53 deg off vertical the thrust term eats the whole
+        // measurement, aeroH reads ~0, nothing changes.) EMA on the t
+        // clock (f206), control-grade per-tick slopes (f143), and the
+        // ratio uses the previous tick's APPLIED out-throttle (f249).
+        private double aMeasHKill = 0;         // EMA of -d|vh|/dt (m/s2, + = braking)
+        private double prevVhMagK = -1;        // previous tick's |vh| for the slope
+        private double lastVhKillMeasT = -1;   // t of that sample
+        private bool measWarmK = false;        // EMA has its first sample
+        private double lastAppliedThrottleK = 0; // last tick's out (applied) throttle
         private double lastV2gDbgT = -100;
         // f92 coast-translation floor: the suicide law manages VERTICAL speed
         // only, so the mid-burn coast (vy under the profile -> throttle ~0)
@@ -1156,6 +1180,12 @@ namespace BoosterGuidance
             v2gTermHeight = v.v2gTermHeight;
             v2gTerminal = v.v2gTerminal;
             v2gBrakeOnlyRadius = v.v2gBrakeOnlyRadius;
+            // 批次四 方案X′ measurement state (aMeasHKill/prevVhMagK/
+            // lastVhKillMeasT/measWarmK/lastAppliedThrottleK) is NOT copied,
+            // same as lastt: the sim's t base is its own, and a sim copy
+            // re-warms the EMA from its own first two LB ticks (cold start
+            // = legacy pricing, ~0.25s) rather than risking a stale slope
+            // against the wrong clock
             lowTiltCapHeight = v.lowTiltCapHeight;
             lowTiltCap = v.lowTiltCap;
             taperSwitchY = v.taperSwitchY;
@@ -2014,6 +2044,16 @@ namespace BoosterGuidance
             BLControllerPhase lastPhase = phase;
             bellyRollPulseDeg = 0; // f114: re-armed every tick; only the BellyFlop lateral pulse block raises it (a stale value would bank the flip)
             Vector3d tgt_r = body.GetWorldSurfacePosition(tgtLatitude, tgtLongitude, tgtAlt) - body.position;
+
+            // 批次四 方案X′: the kill-measurement EMA is LandingBurn-only
+            // state - reset it in every other phase so a re-entered burn
+            // never prices off a stale slope (the phase blocks below run
+            // after this point, sim copies included)
+            if (phase != BLControllerPhase.LandingBurn)
+            {
+                prevVhMagK = -1;
+                measWarmK = false;
+            }
 
             System.Diagnostics.Stopwatch timer = new System.Diagnostics.Stopwatch();
             timer.Start();
@@ -4143,6 +4183,22 @@ namespace BoosterGuidance
                         double vhNow = Vector3d.Exclude(up, vel_air).magnitude;
                         if ((yG > uprightHeight) && (amax > 0) && floorsAttOk)
                         {
+                            // 批次四 方案X′: measured-delivery EMA, sim and
+                            // real identically (f196), t clock throughout
+                            // (f206). Seeds on the first sample after a
+                            // non-LB phase (reset at the top of this method)
+                            double dtK = t - lastVhKillMeasT;
+                            if ((dtK > 1e-3) && (dtK < 5))
+                            {
+                                if (prevVhMagK >= 0)
+                                {
+                                    double instK = (prevVhMagK - vhNow) / dtK;
+                                    aMeasHKill = measWarmK ? (aMeasHKill + (instK - aMeasHKill) * Math.Min(1, dtK / 1.0)) : instK;
+                                    measWarmK = true;
+                                }
+                                prevVhMagK = vhNow;
+                                lastVhKillMeasT = t;
+                            }
                             double tBand = Math.Max((yG - aoaRampLowAlt) / Math.Max(50, -vy), vhKillTBandMin);
                             Vector3d vhVecK = Vector3d.Exclude(up, vel_air);
                             Vector3d tgtHK = Vector3d.Exclude(up, tgt_r - r);
@@ -4347,7 +4403,26 @@ namespace BoosterGuidance
                                 }
                                 if (vhKillDbPass)
                                 {
-                                double vhKillFloor = HGUtils.Clamp(aLatReq / Math.Max(0.1, aLatFull), minThrottle, 1);
+                                // 批次四 方案X′ (f272 4187m前偏): ratio closure
+                                // on the MEASURED delivery - the throttle that
+                                // produced aMeasHKill, scaled by demand/measured,
+                                // delivers the demand (fixed point aero+thr*k =
+                                // aLatReq, source-agnostic). The legacy numerator
+                                // priced the WHOLE demand against the tilt-only
+                                // model amax*sin(knob)=8.6 while the burn actually
+                                // delivered 30-40 through the retrograde thrust
+                                // GEOMETRY (f272: 53deg tilt, thrust horizontal
+                                // 39.8 of amax 49.8) + aero - pinned thr=1.0 and
+                                // braked 4.2km past the stop curve. Closing branch
+                                // only: the overshoot SLAM keeps its full-brake
+                                // price; a cold/weak measurement (<1 m/s2 - burn
+                                // entry, slow terminal) keeps the legacy model
+                                double vhKillFloor;
+                                bool ratioPriced = (!overshotHK) && measWarmK && (aMeasHKill >= 1);
+                                if (ratioPriced)
+                                    vhKillFloor = HGUtils.Clamp(lastAppliedThrottleK * aLatReq / aMeasHKill, minThrottle, 1);
+                                else
+                                    vhKillFloor = HGUtils.Clamp(aLatReq / Math.Max(0.1, aLatFull), minThrottle, 1);
                                 if (throttle < vhKillFloor)
                                 {
                                     throttle = vhKillFloor;
@@ -4356,6 +4431,8 @@ namespace BoosterGuidance
                                         lastVhKillLogT = t;
                                         if (overshotHK)
                                             Log.Info(string.Format("[LandingBurn] vh-kill SLAM: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} -> thr={5:F2} (overshoot FULL brake, f219 - 过冲全力杀, no more gentle pacing)", vhNow, vy, yG, distHK, remHK, throttle));
+                                        else if (ratioPriced)
+                                            Log.Info(string.Format("[LandingBurn] vh-kill floor: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} res={5:F0} tBand={6:F1}s aStop={7:F1} aLatReq={8:F1} aMeas={9:F1} thrPrev={10:F2} -> thr={11:F2} (方案X′ measured-delivery ratio closure)", vhNow, vy, yG, distHK, remHK, vhRes, tBand, aLatStop, aLatReq, aMeasHKill, lastAppliedThrottleK, throttle));
                                         else
                                             Log.Info(string.Format("[LandingBurn] vh-kill floor: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} res={5:F0} tBand={6:F1}s aStop={7:F1} aLatReq={8:F1}/{9:F1} -> thr={10:F2} (exact-stop horizontal kill, 方案R R1 restored - always rides the stop curve; f170 vNeed={12:F0} log-only, res log-only)", vhNow, vy, yG, distHK, remHK, vhRes, tBand, aLatStop, aLatReq, aLatFull, throttle, aoaRampLowAlt, vNeedHK));
                                     }
@@ -5649,6 +5726,11 @@ namespace BoosterGuidance
             attitudeError = HGUtils.angle_between(att, steer);
 
             throttle = HGUtils.Clamp(throttle, 0, 1);
+            // 批次四 方案X′: the APPLIED (final, post-override, post-clamp)
+            // throttle - the ratio closure prices next tick's floor against
+            // what was truly commanded this tick (f249). Unconditional so
+            // sim copies stash their own (f196)
+            lastAppliedThrottleK = throttle;
             if (!simulate)
                 prevThrottleOut = throttle;
 
