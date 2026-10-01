@@ -22,6 +22,10 @@ namespace BoosterGuidance
         static bool loggingActive = false;
         static public bool LoggingActive { get { return loggingActive; } }
 
+        // Name of the current session's log files (without directory/extension),
+        // e.g. "Size3LargeTank_20261002_042020". Null when not logging.
+        static public string SessionLogName { get; private set; }
+
         static public void StartLogging(string shipName)
         {
             if (loggingActive)
@@ -35,11 +39,20 @@ namespace BoosterGuidance
             if (!Directory.Exists(KSPUtil.ApplicationRootPath + LOGDIR))
                 Directory.CreateDirectory(KSPUtil.ApplicationRootPath + LOGDIR);
 
-            actual = new System.IO.StreamWriter(LOGDIR + shipName + ".Actual.dat");
-            free = new System.IO.StreamWriter(LOGDIR + shipName + "..Free.dat");
-            unset = new System.IO.StreamWriter(LOGDIR + shipName + ".Simulate.Unset.dat");
-            simuate = new System.IO.StreamWriter(LOGDIR + shipName + ".Simulate.dat");
-            manual = new System.IO.StreamWriter(LOGDIR + shipName + ".manual.dat");
+            // Session-scoped filenames (flight-logging-v2 LOG-3): a reflight of the
+            // same vessel name must never truncate the previous flight's log.
+            string safeName = shipName;
+            foreach (char c in System.IO.Path.GetInvalidFileNameChars())
+                safeName = safeName.Replace(c, '_');
+            string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            string sessionBase = LOGDIR + safeName + "_" + stamp;
+            SessionLogName = safeName + "_" + stamp;
+
+            actual = new System.IO.StreamWriter(sessionBase + ".Actual.dat");
+            free = new System.IO.StreamWriter(sessionBase + ".Free.dat");
+            unset = new System.IO.StreamWriter(sessionBase + ".Simulate.Unset.dat");
+            simuate = new System.IO.StreamWriter(sessionBase + ".Simulate.dat");
+            manual = new System.IO.StreamWriter(sessionBase + ".manual.dat");
             // Flush every line so the log survives a crash/alt-F4 instead of
             // sitting in the StreamWriter buffer until Close
             actual.AutoFlush = true;
@@ -48,7 +61,7 @@ namespace BoosterGuidance
             simuate.AutoFlush = true;
             manual.AutoFlush = true;
             loggingActive = true;
-            InitLog.Log.Info("StartLogging: " + shipName);
+            InitLog.Log.Info("StartLogging: " + SessionLogName);
         }
 
         static public void EndLogging()
@@ -62,6 +75,7 @@ namespace BoosterGuidance
                 simuate.Close();
                 manual.Close();
                 loggingActive = false;
+                SessionLogName = null;
             }
         }
         static public void Log(LogType logtype, string str)

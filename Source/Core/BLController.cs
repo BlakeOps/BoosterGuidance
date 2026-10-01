@@ -569,6 +569,32 @@ namespace BoosterGuidance
         private Vector3d trajLogImpact = Vector3d.zero; // body-rel frame at trajLogImpactT
         private double trajLogImpactT = -1;
         private bool trajLogForceDone = false;
+        // ---- flight-logging-v2 logging-side state -------------------------
+        // READOUT ONLY: no control branch may read any of these (f143: the
+        // aTot EMA is a SEPARATE instance from every control filter; f206:
+        // dt-normalized on the mission t-clock, never Time.deltaTime).
+        private string steerOwnerTick = null;   // D4 coarse owner tag, reset per tick
+        private void TagOwner(string tag) { steerOwnerTick = tag; }                        // floors/events: unconditional
+        private void TagOwnerSteer(string tag) { if (steerOwnerTick == null) steerOwnerTick = tag; } // steer laws yield to floors
+        private double lastALatReqLog = double.NaN;   // brake-budget triple, stashed in the vh-kill floor block
+        private double lastAMeasHLog = double.NaN;
+        private double lastThrFloorLog = double.NaN;
+        private bool vhKillFloorActiveTick = false;
+        private double predBodyRelPosLogT = -1;       // t of the predBodyRelPos assignment (own_x/own_z freshness)
+        private double lastLogRowT = -10;             // sampler: t of the last written row
+        private BLControllerPhase lastLoggedPhase = BLControllerPhase.Unset;
+        private double lastPhaseChangeLogT = -10;
+        private int lastEngOnLog = -1;
+        private bool lastRowTagged = false;           // densify trigger: previous row carried an anomaly tag
+        private bool touchdownLogged = false;         // epilogue written once
+        private double prevLogTerr = double.NaN;      // anomaly detectors' previous-tick values
+        private double prevLogTrajX = double.NaN, prevLogTrajZ = double.NaN;
+        private double prevLogThr = double.NaN;
+        private Vector3d prevLogVel = Vector3d.zero;  // aTot EMA state
+        private double prevLogVelT = -1;
+        private double aTotHLog = 0, aTotVLog = 0;
+        private bool aTotWarm = false;
+        private string logTagsAcc = "";               // anomaly tags accumulated since the last written row
         private Vector3d trajErrSmooth = Vector3d.zero; // altitude-smoothed impact error vector (f77: raw swings drove a 95-deg attitude chase)
         private bool trajErrSmoothInit = false;
         private double trajAlong = 0; // smoothed along-track error (+ = impact LONG), m
@@ -1591,6 +1617,42 @@ namespace BoosterGuidance
         public double simLastDvBoostback = 0;
 
 
+        // First 8 hex chars of the running assembly's MD5 - computed once per
+        // process so every v2 log header self-identifies the build that flew it
+        // (flight-logging-v2 D2; replaces the post-flight MD5-verification ritual).
+        private static string buildMd5_8 = null;
+        private static string BuildMd5_8()
+        {
+            if (buildMd5_8 == null)
+            {
+                try
+                {
+                    string loc = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                    using (var md5 = System.Security.Cryptography.MD5.Create())
+                    using (var fs = System.IO.File.OpenRead(loc))
+                    {
+                        byte[] h = md5.ComputeHash(fs);
+                        var sb = new System.Text.StringBuilder();
+                        for (int i = 0; i < 4; i++)
+                            sb.Append(h[i].ToString("x2"));
+                        buildMd5_8 = sb.ToString();
+                    }
+                }
+                catch (Exception)
+                {
+                    buildMd5_8 = "unknown";
+                }
+            }
+            return buildMd5_8;
+        }
+
+        // v2 column manifest - emitted verbatim into the header so parsers never
+        // hardcode positions; row writes MUST follow this order exactly (D1).
+        private const string V2Columns =
+            "t phase x y z vx vy vz ax ay az att_err amin amax steer_gain target_error totalMass traj_x traj_z" +
+            " own_x own_z tiltDeg tiltAz steerAz aTotH aTotV omx omy omz glideSlope" +
+            " aLatReq aMeasH thrFloor thr fuelKg engOn trajAge wallT owner tags";
+
         // Note: filename is the basename from which we appent
         //  .actual.dat
         //  .after_boostback.dat
@@ -1600,8 +1662,16 @@ namespace BoosterGuidance
             {
                 Utils.StartLogging(filename);
                 SetUpLogTransform(filename);
-                Utils.Log(Utils.LogType.actual, "time phase x y z vx vy vz ax ay az att_err amin amax steer_gain target_error totalMass traj_x traj_z");
+                Utils.Log(Utils.LogType.actual, "# format v2");
+                Utils.Log(Utils.LogType.actual, "# build " + BuildMd5_8());
+                Utils.Log(Utils.LogType.actual, "# columns " + V2Columns);
                 logStartTime = vessel.missionTime;
+                // flight-logging-v2 session state reset
+                lastLogRowT = -10; lastLoggedPhase = phase; lastPhaseChangeLogT = vessel.missionTime;
+                lastEngOnLog = -1; lastRowTagged = false; touchdownLogged = false; logTagsAcc = "";
+                prevLogTerr = double.NaN; prevLogTrajX = double.NaN; prevLogTrajZ = double.NaN; prevLogThr = double.NaN;
+                prevLogVelT = -1; aTotWarm = false;
+                lastALatReqLog = double.NaN; lastAMeasHLog = double.NaN; lastThrFloorLog = double.NaN;
                 Log.Info("BLController.StartLogging: " + filename + " phase=" + phase + " missionTime=" + vessel.missionTime);
                 LogSimulation();
             }
@@ -2043,6 +2113,10 @@ namespace BoosterGuidance
             float minThrottle = 0.01f;
             BLControllerPhase lastPhase = phase;
             bellyRollPulseDeg = 0; // f114: re-armed every tick; only the BellyFlop lateral pulse block raises it (a stale value would bank the flip)
+            // flight-logging-v2: per-tick readout-tag reset (these fields are
+            // never read by any control branch - write-only instrumentation)
+            steerOwnerTick = null;
+            vhKillFloorActiveTick = false;
             Vector3d tgt_r = body.GetWorldSurfacePosition(tgtLatitude, tgtLongitude, tgtAlt) - body.position;
 
             // 批次四 方案X′: the kill-measurement EMA is LandingBurn-only
@@ -2326,6 +2400,7 @@ namespace BoosterGuidance
                 // limit cycle flooded the log at 5 lines/s)
                 bool predTimeout = targetT >= PredictionMaxT() - 0.1;
                 predBodyRelPos = newPred;
+                predBodyRelPosLogT = t; // flight-logging-v2: freshness for the own_x/own_z columns
                 // f189 方案C (user-approved, DIAGNOSTIC ONLY - no behavior
                 // change): f188 (light ship) late glide - the own-sim plan
                 // error jumped +-30..120 m between pred ticks while the ship
@@ -2533,6 +2608,7 @@ namespace BoosterGuidance
                         steer = -Vector3d.Normalize(error);
                     else
                         steer = (vhVec.magnitude > 1) ? -Vector3d.Normalize(vhVec) : att; // hold if no horizontal velocity yet
+                    TagOwnerSteer("TA-steer");
                     throttle = 0;
                     if (turnAroundStart < 0)
                         turnAroundStart = t;
@@ -3110,6 +3186,7 @@ namespace BoosterGuidance
                         // user: "抬升机头减速阶段不要有任何横向修正,不然会
                         // 出现之前的自旋情况,滑行的时候正常横向修正就行"
                         steer = -Vector3d.Normalize(vel_air);
+                        TagOwnerSteer("belly-hold"); // aoaMod braking: pure retrograde hold, no lateral correct (f95)
                     }
                     else
                     {
@@ -3245,6 +3322,7 @@ namespace BoosterGuidance
                     // nose-tilt convention, so SUBTRACT. If the next flight
                     // diverges faster instead, flip this back
                     steer = -Vector3d.Normalize(vel_air) - corr * starshipCorrectionGain;
+                    TagOwnerSteer("belly-corr");
                     }
                 }
                 // Flip trigger (design D8, revised after flight 44): the old
@@ -3326,6 +3404,7 @@ namespace BoosterGuidance
                 steer = (vhFlip.magnitude > 1)
                     ? Vector3d.Normalize(up - flipUprightLean * Vector3d.Normalize(vhFlip))
                     : Vector3d.Normalize(up);
+                TagOwnerSteer("flip");
                 attitudeError = HGUtils.angle_between(att, steer);
                 // Airbrake pitch-up assist + burn-during-flip (see the field
                 // comment): light once the nose is clearly swinging up
@@ -3378,6 +3457,7 @@ namespace BoosterGuidance
             {
                 // Aim to close max of 20% of error in 1 second
                 steer = -Vector3d.Normalize(error);
+                TagOwnerSteer("BB-steer");
                 // Safety checks in inverse cosine
                 attitudeError = HGUtils.angle_between(att, steer);
                 double dv = error.magnitude / targetT; // estimated delta V needed
@@ -3759,6 +3839,7 @@ namespace BoosterGuidance
                     steerGain = pid_reentry.kp;
                     double ang = pid_reentry.Update(rbErrSteer.magnitude, Time.deltaTime);
                     steer = -Vector3d.Normalize(vel_air) + GetSteerCorrection(rbErrSteer, ang, EffectiveMaxAoA(reentryBurnMaxAoA, y), omegaLat);
+                    TagOwnerSteer("RB-steer");
                     attitudeError = HGUtils.angle_between(att, steer);
                 }
                 }
@@ -3799,6 +3880,7 @@ namespace BoosterGuidance
                         steer = -velN * Math.Cos(phi) + tDir * Math.Sin(phi);
                     }
                     steerGain = phiDeg; // Actual.dat steer_gain column = commanded glide angle this phase
+                    TagOwnerSteer("AD-manual");
                     if ((!simulate) && (t - glideAoALogT > 5))
                     {
                         glideAoALogT = t;
@@ -3832,6 +3914,7 @@ namespace BoosterGuidance
                         {
                             aeroErrSm = error;
                             aeroOsStreak = 0;
+                            TagOwner("OS-SNAP"); // flight-logging-v2: the snap owns this tick's steer basis
                             Log.Info(string.Format("[AeroDescent] OS-SNAP t={0:F1} y={1:F0} err={2:F0} - overshoot flip certified, EMA resynced to raw", t, yG, error.magnitude));
                         }
                     }
@@ -3919,6 +4002,7 @@ namespace BoosterGuidance
                     else if (demMag <= 0)
                         aeroTrimAtt = Vector3d.Normalize(aeroTrimAtt + (att - aeroTrimAtt) * HGUtils.Clamp(dtLA / 15.0, 0, 1));
                     steer = aeroTrimAtt + GetSteerCorrection(aeroErrSm, ang, angCapA, omegaLat);
+                    TagOwnerSteer("AD-glide");
                 }
 
                 double landingMinThrust, landingMaxThrust;
@@ -4423,9 +4507,17 @@ namespace BoosterGuidance
                                     vhKillFloor = HGUtils.Clamp(lastAppliedThrottleK * aLatReq / aMeasHKill, minThrottle, 1);
                                 else
                                     vhKillFloor = HGUtils.Clamp(aLatReq / Math.Max(0.1, aLatFull), minThrottle, 1);
+                                // flight-logging-v2 (D1): brake-budget triple
+                                // readout - stash where the locals live; the
+                                // row writer NaNs them when the floor is off
+                                lastALatReqLog = aLatReq;
+                                lastAMeasHLog = measWarmK ? aMeasHKill : double.NaN;
+                                lastThrFloorLog = vhKillFloor;
+                                vhKillFloorActiveTick = true;
                                 if (throttle < vhKillFloor)
                                 {
                                     throttle = vhKillFloor;
+                                    TagOwner(overshotHK ? "vh-kill-slam" : "vh-kill-floor");
                                     if ((!simulate) && (t - lastVhKillLogT > 5))
                                     {
                                         lastVhKillLogT = t;
@@ -4461,6 +4553,7 @@ namespace BoosterGuidance
                                 if (throttle < corrFloor)
                                 {
                                     throttle = corrFloor;
+                                    TagOwner("corr-floor");
                                     if ((!simulate) && (t - lastCorrFloorLogT > 5))
                                     {
                                         lastCorrFloorLogT = t;
@@ -4535,7 +4628,10 @@ namespace BoosterGuidance
                                 // mark reads "hold the engine-off glide until
                                 // the profile, then land plain"
                                 if ((burnLatMode == 1) && (!coneGuard) && (profileDemandLB < 0.6) && (!manualLandActive))
+                                {
                                     throttle = minThrottle;
+                                    TagOwner("AERO-cut"); // flight-logging-v2: engine-off owner visible in the row
+                                }
                             }
                         }
                         else if (!simulate)
@@ -4564,12 +4660,14 @@ namespace BoosterGuidance
                                 else if ((t - coastTransStartT > 15) && (pErrMag > 0.9 * coastTransStartErr))
                                 {
                                     coastTransGiveUp = true;
+                                    TagOwner("trans-giveup");
                                     Log.Info(string.Format("[LandingBurn] trans-floor GIVE-UP: y={0:F0} posErr={1:F0} was {2:F0} 15s ago - the floor cannot win this one, saving the fuel for the suicide burn", yG, pErrMag, coastTransStartErr));
                                 }
                                 double transFloor = Math.Min(coastTransThrottle, 0.85 * g / Math.Max(1, amax));
                                 if ((!coastTransGiveUp) && (throttle < transFloor))
                                 {
                                     throttle = transFloor;
+                                    TagOwner("trans-floor");
                                     if (t - lastCoastTransLogT > 5)
                                     {
                                         lastCoastTransLogT = t;
@@ -4675,6 +4773,7 @@ namespace BoosterGuidance
                                 corrS = Vector3d.Normalize(corrS) * allowedS;
                         }
                         steer = up + translateAuth * corrS;
+                        TagOwnerSteer("term-translate");
                         steerGain = v2gKp;
                     }
                     else
@@ -5186,6 +5285,7 @@ namespace BoosterGuidance
                     }
                     // Steer retrograde with added up component to damp oscillations at slow speed near ground
                     steer = -Vector3d.Normalize(vel_air - 20 * up) + corr;
+                    TagOwnerSteer("term-falcon");
                     }
                 }
                 else
@@ -5221,12 +5321,14 @@ namespace BoosterGuidance
                                 corrB = Vector3d.Normalize(corrB) * allowedB;
                         }
                         steer = up + HGUtils.Clamp(throttle / 0.1, 0, 1) * corrB;
+                        TagOwnerSteer("term-starship");
                         steerGain = v2gKp;
                     }
                     else
                     {
                     // Just cancel velocity with significant upwards component to stay upright
                     steer = -Vector3d.Normalize(vel_air - 20 * up);
+                    TagOwnerSteer("term-plain");
                     if ((!simulate) && (v2gTerminal))
                     {
                         // Below noSteerHeight (v2gTerminal): velocity braking
@@ -5373,6 +5475,14 @@ namespace BoosterGuidance
             if ((!simulate) && ((phase == BLControllerPhase.LandingBurn) || (phase == BLControllerPhase.AeroDescent)))
                 attitudeError = HGUtils.angle_between(att, steer);
 
+            // flight-logging-v2: row payload stash (method scope) - the row
+            // itself is written after the final throttle clamp at method end
+            // so the thr column is the APPLIED throttle (f249; BigTrim below
+            // can still change throttle after the logging block)
+            bool v2RowArmed = false;
+            Vector3d trL = Vector3d.zero, tvL = Vector3d.zero, taL = Vector3d.zero;
+            double trajXL = double.NaN, trajZL = double.NaN;
+
             // Logging (real flight only - simulation copies must not pollute the actual log)
             if (Utils.LoggingActive && !simulate)
             {
@@ -5433,8 +5543,12 @@ namespace BoosterGuidance
                     trajZ = tImp.z;
                 }
 
-                Utils.Log(Utils.LogType.actual, String.Format("{0:F1} {1} {2:F1} {3:F1} {4:F1} {5:F1} {6:F1} {7:F1} {8:F1} {9:F1} {10:F1} {11:F1} {12:F1} {13:F1} {14:F3} {15:F1} {16:F2} {17:F1} {18:F1}",
-                    t - logStartTime, phase, tr.x, tr.y, tr.z, tv.x, tv.y, tv.z, ta.x, ta.y, ta.z, attitudeError, amin, amax, steerGain, targetError, totalMass, trajX, trajZ));
+                // flight-logging-v2: stash the row payload (written at method
+                // end, post throttle clamp). The 19 legacy columns keep their
+                // exact formats/values; 21 v2 columns append there.
+                trL = tr; tvL = tv; taL = ta;
+                trajXL = trajX; trajZL = trajZ;
+                v2RowArmed = true;
                 // f196 手动着陆姿态记录 (user: 我来操控几次着陆段的姿态调整,
                 // 你记录并分析学习): per-tick rows while the panel toggle is
                 // armed and the burn is live. man=1 rows are player-flown
@@ -5734,6 +5848,141 @@ namespace BoosterGuidance
             if (!simulate)
                 prevThrottleOut = throttle;
 
+            // ==================== flight-logging-v2 row writer ====================
+            // Runs after the final throttle clamp so thr is the APPLIED value
+            // (f249). All measurement filters here are logging-only instances
+            // (f143), dt-normalized on the mission t-clock (f206). Sampler (D3):
+            // 1.0 s heartbeat; 0.1 s densify within 10 s after a phase change /
+            // below y<2000 / while the vh-kill floor is active / while an
+            // anomaly tag is pending; FULL rate (every tick) below y<200 = the
+            // tip-over slow-motion window (user request: 侧倾炸 data collection).
+            // Filter state updates are NOT sampler-gated - decimation must not
+            // starve them.
+            if (v2RowArmed)
+            {
+                double tLog = t - logStartTime;
+                Vector3d vhNowL = Vector3d.Exclude(up, vel_air);
+
+                // aTot: total accel from velocity slopes, logging-only EMA
+                // (tau~0.3 s). aero = aTot - thrust in analysis (legacy ax..az
+                // columns are thrust-only, f238). aTotH signed along the
+                // horizontal motion: negative = braking.
+                if (prevLogVelT >= 0)
+                {
+                    double dtV = t - prevLogVelT;
+                    if (dtV > 1e-4)
+                    {
+                        Vector3d aTot = (vel_air - prevLogVel) / dtV;
+                        double aHInst = (vhNowL.magnitude > 0.5) ? Vector3d.Dot(aTot, vhNowL / vhNowL.magnitude) : 0;
+                        double aVInst = Vector3d.Dot(aTot, up);
+                        if (!aTotWarm) { aTotHLog = aHInst; aTotVLog = aVInst; aTotWarm = true; }
+                        else
+                        {
+                            double kA = Math.Min(1, dtV / 0.3);
+                            aTotHLog += (aHInst - aTotHLog) * kA;
+                            aTotVLog += (aVInst - aTotVLog) * kA;
+                        }
+                    }
+                }
+                prevLogVel = vel_air;
+                prevLogVelT = t;
+
+                int engOn = 0;
+                List<ModuleEngines> opEngs = KSPUtils.GetOperationalEngines(vessel);
+                foreach (ModuleEngines eng in opEngs)
+                    if (!eng.flameout) engOn++;
+                double fuelKg = KSPUtils.ComputeUsablePropellantKg(vessel, opEngs);
+                int engOnPrev = lastEngOnLog;
+
+                // anomaly tags (D5) - accumulated across ticks until the next
+                // written row so a fast anomaly between heartbeats is neither
+                // lost nor denied its densification
+                string tickTags = "";
+                if ((!double.IsNaN(prevLogTerr)) && (Math.Abs(targetError - prevLogTerr) > 200)) tickTags += "|TERRJMP";
+                if ((!double.IsNaN(trajXL)) && (!double.IsNaN(prevLogTrajX)) &&
+                    (Math.Sqrt((trajXL - prevLogTrajX) * (trajXL - prevLogTrajX) + (trajZL - prevLogTrajZ) * (trajZL - prevLogTrajZ)) > 200)) tickTags += "|TRAJJMP";
+                if ((!double.IsNaN(prevLogThr)) && (Math.Abs(throttle - prevLogThr) > 0.3)) tickTags += "|THRJMP";
+                if ((engOnPrev > 0) && (engOn == 0) && (throttle > 0)) tickTags += "|FLAMEOUT";
+                prevLogTerr = targetError;
+                prevLogTrajX = trajXL; prevLogTrajZ = trajZL;
+                prevLogThr = throttle;
+
+                // event lines (D6) - every tick, never sampler-gated
+                if (phase != lastLoggedPhase)
+                {
+                    Utils.Log(Utils.LogType.actual, string.Format("# phase {0}->{1} t={2:F1} y={3:F0} vy={4:F1} vh={5:F1} dist={6:F0} terr={7:F0} thr={8:F2} fuelKg={9:F0}",
+                        lastLoggedPhase, phase, tLog, yG, vy, vhNowL.magnitude,
+                        Vector3d.Exclude(up, r - tgt_r).magnitude, targetError, throttle, fuelKg));
+                    lastLoggedPhase = phase;
+                    lastPhaseChangeLogT = t;
+                }
+                if (engOnPrev < 0)
+                    lastEngOnLog = engOn;
+                else if (engOn != engOnPrev)
+                {
+                    Utils.Log(Utils.LogType.actual, string.Format("# engines {0} t={1:F1} n={2}", (engOn > 0) ? "on" : "off", tLog, engOn));
+                    lastEngOnLog = engOn;
+                }
+
+                // derived columns
+                double ownX = double.NaN, ownZ = double.NaN;
+                if ((predBodyRelPosLogT >= 0) && (t - predBodyRelPosLogT < trajImpactMaxAge))
+                {
+                    Vector3d ownImp = predBodyRelPos;
+                    double ownAge = t - predBodyRelPosLogT;
+                    if (ownAge > 0.01) // same body-spin forward rotation as the f136 traj block
+                        ownImp = (Vector3d)(Quaternion.AngleAxis((float)(ownAge * body.angularVelocity.magnitude * Mathf.Rad2Deg), body.angularVelocity.normalized) * (Vector3)predBodyRelPos);
+                    Vector3d oImp = logTransform.InverseTransformPoint(ownImp + body.position);
+                    ownX = oImp.x;
+                    ownZ = oImp.z;
+                }
+                double tiltDeg = HGUtils.angle_between(att, up);
+                if ((phase == BLControllerPhase.LandingBurn) && (tiltDeg > 15)) tickTags += "|TILT";
+                Vector3d attL = logTransform.InverseTransformVector(att);
+                double tiltAz = (Math.Abs(attL.x) + Math.Abs(attL.z) > 1e-6) ? Math.Atan2(attL.x, attL.z) * Mathf.Rad2Deg : double.NaN;
+                Vector3d stL = logTransform.InverseTransformVector(steer);
+                double steerAz = (Math.Abs(stL.x) + Math.Abs(stL.z) > 1e-6) ? Math.Atan2(stL.x, stL.z) * Mathf.Rad2Deg : double.NaN;
+                Vector3d omB = Quaternion.Inverse(vessel.ReferenceTransform.rotation) * vessel.angularVelocity; // body frame, rad/s
+                double distL = Math.Sqrt(trL.x * trL.x + trL.z * trL.z);
+                double glideSlope = (y > 1) ? Math.Atan2(distL, y) * Mathf.Rad2Deg : double.NaN;
+                double trajAge = (trajLogImpactT >= 0) ? (t - trajLogImpactT) : double.NaN;
+                string owner = (steerOwnerTick != null) ? steerOwnerTick : phase.ToString();
+                double aLatReqOut = (vhKillFloorActiveTick) ? lastALatReqLog : double.NaN;
+                double aMeasHOut = (vhKillFloorActiveTick) ? lastAMeasHLog : double.NaN;
+                double thrFloorOut = (vhKillFloorActiveTick) ? lastThrFloorLog : double.NaN;
+
+                // merge this tick's tags into the pending accumulator
+                if (tickTags.Length > 0)
+                {
+                    foreach (string tg in tickTags.Substring(1).Split('|'))
+                        if (!logTagsAcc.Contains(tg)) logTagsAcc += "|" + tg;
+                }
+
+                // sampler gate (D3)
+                bool fullRate = y < 200;
+                bool densify = fullRate || (t - lastPhaseChangeLogT < 10) || (y < 2000) || vhKillFloorActiveTick || lastRowTagged || (logTagsAcc.Length > 0);
+                double interval = fullRate ? 0 : (densify ? 0.1 : 1.0);
+                if (tLog - lastLogRowT >= interval - 1e-9)
+                {
+                    lastLogRowT = tLog;
+                    lastRowTagged = logTagsAcc.Length > 0;
+                    string tagsOut = lastRowTagged ? logTagsAcc.Substring(1) : "-";
+                    logTagsAcc = "";
+                    Utils.Log(Utils.LogType.actual, String.Format(
+                        "{0:F1} {1} {2:F1} {3:F1} {4:F1} {5:F1} {6:F1} {7:F1} {8:F1} {9:F1} {10:F1} {11:F1} {12:F1} {13:F1} {14:F3} {15:F1} {16:F2} {17:F1} {18:F1} {19:F1} {20:F1} {21:F1} {22:F1} {23:F1} {24:F2} {25:F2} {26:F1} {27:F1} {28:F1} {29:F1} {30:F2} {31:F2} {32:F2} {33:F2} {34:F0} {35} {36:F1} {37} {38} {39}",
+                        tLog, phase, trL.x, trL.y, trL.z, tvL.x, tvL.y, tvL.z, taL.x, taL.y, taL.z,
+                        attitudeError, amin, amax, steerGain, targetError, totalMass, trajXL, trajZL,
+                        ownX, ownZ, tiltDeg,
+                        tiltAz, steerAz,
+                        aTotHLog, aTotVLog,
+                        omB.x * Mathf.Rad2Deg, omB.y * Mathf.Rad2Deg, omB.z * Mathf.Rad2Deg,
+                        glideSlope,
+                        aLatReqOut, aMeasHOut, thrFloorOut,
+                        throttle, fuelKg, engOn, trajAge,
+                        DateTime.Now.ToString("HH:mm:ss"), owner, tagsOut));
+                }
+            }
+
             // Log simulate to ground when phase changes (real flight only, avoid recursive sim logging)
             // So the logging is done at the start of the new phase
             if ((lastPhase != phase) && (Utils.LoggingActive) && (!simulate))
@@ -5766,6 +6015,18 @@ namespace BoosterGuidance
             if (vessel.checkLanded())
             {
                 info = string.Format(Localizer.Format("#BoosterGuidance_LandedXFromTarget", tgtErrStr));
+                // flight-logging-v2 (D6): the one-line landing verdict -
+                // offset + vy + vh + tilt + rotation settle "accurate but
+                // tipped" (f270/f273/f275) without archaeology
+                if ((!simulate) && Utils.LoggingActive && (!touchdownLogged))
+                {
+                    touchdownLogged = true;
+                    Vector3d omTd = Quaternion.Inverse(vessel.ReferenceTransform.rotation) * vessel.angularVelocity;
+                    Utils.Log(Utils.LogType.actual, string.Format("# touchdown t={0:F1} offset={1:F1} vy={2:F1} vh={3:F1} tilt={4:F1} om={5:F1} fuelKg={6:F0}",
+                        t - logStartTime, Vector3d.Exclude(up, r - tgt_r).magnitude, vy,
+                        Vector3d.Exclude(up, vel_air).magnitude, HGUtils.angle_between(att, up),
+                        omTd.magnitude * Mathf.Rad2Deg, KSPUtils.ComputeUsablePropellantKg(vessel)));
+                }
             }
             else
             {
