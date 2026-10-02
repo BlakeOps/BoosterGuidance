@@ -971,6 +971,14 @@ namespace BoosterGuidance
         private bool aeroTrimValid = false;
         private double aeroLastTA = -1;         // real-clock stamp for the AeroDescent gain EMA (f206 rule: same clock as the timeouts)
         private double lastAeroCapLogT = -100;  // ADAPT CAP log cadence
+        // 批次五 (ad-lowalt-active-correction, user-approved 2026-10-02): AD
+        // low-altitude ACTIVE cancellation. adCancelEngaged = the D2 gate's
+        // hysteresis memory (engage at errSm > 3x the measured prediction
+        // noise floor, disengage below 2x - f132). Real-flight-only branch
+        // (!simulate) so sim copies never see it; not carried by the copy
+        // ctor. Design/anchors: openspec/changes/ad-lowalt-active-correction
+        private bool adCancelEngaged = false;
+        private double lastAdCancelLogT = -100; // AD-CANCEL log cadence
         private double profileDemandLB = 0;     // this tick's throttle before the floors (suicide-profile demand)
         private double lastLatModeLogT = -100;
         // f230+f231 方案三: terminal steer diagnostics - the last v2g call's
@@ -1857,6 +1865,48 @@ namespace BoosterGuidance
             return stopRatio <= 2.0;
         }
 
+        // 批次五 D2 (ad-lowalt-active-correction, user-approved 2026-10-02):
+        // honesty certification for the AD low-altitude cancellation gate,
+        // factored pure for the ADLowaltReplay gate. The smoothed error must
+        // dominate the MEASURED prediction noise floor (3x engage / 2x
+        // disengage - f132 hysteresis on a noisy signal; unseeded noise (<=0)
+        // can never certify). f280 anchors: phantom zone (y 26-40 km) the raw
+        // error swung 126..3160 m between prediction runs (noise floor of
+        // several hundred m = ratio cannot hold); honest zone (y<26 km) the
+        // error declined smoothly 871->64 (noise tens of m = ratio >> 3).
+        public static bool AdCancelHonest(double errSmMag, double predNoiseSm, bool engagedPrev)
+        {
+            if (predNoiseSm <= 0) return false;
+            return errSmMag > (engagedPrev ? 2.0 : 3.0) * predNoiseSm;
+        }
+
+        // 批次五 D1: delivered-force pricing of the cancellation departure.
+        // Solves the departure angle A (corr convention, same units as
+        // GetSteerCorrection's cap) whose SECANT force delta over the trim
+        // attitude meets aReq: probeDeliveredAt(A) must return
+        // |F(A off trim) - F(trim)| / mass in m/s2 (a pure-function aero
+        // probe in flight, synthetic curves in the gate). The per-degree
+        // slope at the trim working point is NOT trusted for this: on the
+        // belly brick it reads ~0.03 (stall side of the force curve) while
+        // the productive departure's real delivery is -7..-11 m/s2 (f280
+        // measured) - only the secant over the whole departure prices that.
+        // Form: linear guess from the full-authority point, one secant
+        // correction, hard cap 55 (flight-16 guard lineage; f280 needed ~24
+        // in these units). aReq beyond full-authority delivery pins the cap
+        // = max effort, continuous in aReq (no bang-bang). No authority at
+        // all -> 0 = the caller keeps the legacy envelope.
+        public static double AdCancelDeparture(double aReq, Func<double, double> probeDeliveredAt, double hardCapDeg = 55)
+        {
+            if (aReq <= 0) return 0;
+            double dCap = probeDeliveredAt(hardCapDeg);
+            if (dCap <= 0) return 0;
+            if (aReq >= dCap) return hardCapDeg;
+            double a1 = hardCapDeg * aReq / dCap;
+            double d1 = probeDeliveredAt(a1);
+            if (d1 <= 0.01) return a1;
+            return HGUtils.Clamp(a1 * aReq / d1, 0, hardCapDeg);
+        }
+
         // f193: side-force probe at a PARAMETERIZED AoA (the 15 deg probe
         // under-reads the brick - user: 15度倾斜度不够). sideFA = aero lift
         // magnitude at probeAoADeg, sideFT = thrust side component at the
@@ -2325,6 +2375,7 @@ namespace BoosterGuidance
                 aeroErrSmInit = false;
                 aeroTrimValid = false;
                 aeroOsStreak = 0; aeroErrMagPrev = -1; // 甲 hygiene
+                adCancelEngaged = false;             // 批次五 gate memory dies with the phase
             }
             // Passive glide: no prediction sim at all - the attitude schedule
             // flies the pure aero brake and nothing consumes an impact error.
@@ -3980,10 +4031,11 @@ namespace BoosterGuidance
                     // per-degree side force. No measured authority -> the PID
                     // fallback flies unchanged.
                     double ang;
+                    double aReq = 0;
                     if (capMeasured)
                     {
                         double tResp = HGUtils.Clamp(tGoA / 3, 5, 20);
-                        double aReq = 2.0 * demMag / (tResp * tResp);
+                        aReq = 2.0 * demMag / (tResp * tResp);
                         ang = aReq / aPerDegASm;
                     }
                     else
@@ -4001,8 +4053,60 @@ namespace BoosterGuidance
                     if (!aeroTrimValid) { aeroTrimAtt = -Vector3d.Normalize(vel_air); aeroTrimValid = true; }
                     else if (demMag <= 0)
                         aeroTrimAtt = Vector3d.Normalize(aeroTrimAtt + (att - aeroTrimAtt) * HGUtils.Clamp(dtLA / 15.0, 0, 1));
+                    // 批次五 (ad-lowalt-active-correction, user-approved
+                    // 2026-10-02): low-altitude ACTIVE cancellation. D2 gate:
+                    // demand + measured honesty (3x/2x noise hysteresis) +
+                    // measured authority. D3 guard: the sim's no-maneuver
+                    // predicted LB handover must be stoppable (思路1 witness,
+                    // harvested every prediction run) - buying cancellation at
+                    // the price of an un-killable arrival is f276's thin-margin
+                    // disease, so a failing/absent witness collapses the
+                    // maneuver to the flight-proven legacy envelope. D1: the
+                    // departure is priced by the DELIVERED secant force over
+                    // trim (AdCancelDeparture). Outside the gate the legacy
+                    // law flies byte-equivalent. NOTE: starship-profile
+                    // vessels run no own-sim prediction (f55-f72 history) ->
+                    // no noise seed, no LB witness -> never engages there
+                    // (legacy by construction); f276-f280 all fly falcon
+                    // profile. Real-flight-only: sim copies glide default
+                    // retrograde so the mark re-predicts honestly (f186/f196).
+                    adCancelEngaged = (demMag > 0) && capMeasured && AdCancelHonest(errSmMag, predNoiseSm, adCancelEngaged);
+                    bool adCancelActive = false;
+                    if (adCancelEngaged)
+                    {
+                        double aLatLBa = ((landingBurnAMax > 0) ? landingBurnAMax : amax)
+                                       * Math.Sin(EffectiveMaxAoALB(landingBurnMaxAoA, Math.Max(1000, landingBurnHeight)) * deg2rad);
+                        bool handoverFits = (rbLbT >= 0) && (t - rbLbT < 8)
+                                          && ReentryHandoverFeasible(rbLbVh, rbLbRem, aLatLBa);
+                        if (handoverFits)
+                        {
+                            Vector3d corrUnit = Vector3d.Normalize(aeroErrSm);
+                            Vector3d velNA = Vector3d.Normalize(vel_air);
+                            double tiltTrim = Math.Acos(HGUtils.Clamp(Vector3d.Dot(aeroTrimAtt, -velNA), -1, 1)) / deg2rad;
+                            Vector3d Ftrim = aeroModel.GetForces(vessel.mainBody, r, vel_air, (180 - tiltTrim) * deg2rad);
+                            Func<double, double> deliveredAt = (double A) =>
+                            {
+                                Vector3d steerP = Vector3d.Normalize(aeroTrimAtt + corrUnit * (A * deg2rad));
+                                double tiltP = Math.Acos(HGUtils.Clamp(Vector3d.Dot(steerP, -velNA), -1, 1)) / deg2rad;
+                                Vector3d FP = aeroModel.GetForces(vessel.mainBody, r, vel_air, (180 - tiltP) * deg2rad);
+                                return (FP - Ftrim).magnitude * aeroMult / Math.Max(1, totalMass);
+                            };
+                            double depSolve = AdCancelDeparture(aReq, deliveredAt);
+                            if (depSolve > angCapA)
+                            {
+                                ang = depSolve;    // GetSteerCorrection caps at angCapA = the solved departure
+                                angCapA = depSolve;
+                                adCancelActive = true;
+                            }
+                        }
+                        if (t - lastAdCancelLogT > 5)
+                        {
+                            lastAdCancelLogT = t;
+                            Log.Info(string.Format("[AeroDescent] AD-CANCEL: t={0:F1} y={1:F0} errSm={2:F0} noise={3:F0} db={4:F0} aPerDeg={5:F4} aReq={6:F2} handover={7} cap={8:F1} ang={9:F1} active={10}", t, yG, errSmMag, predNoiseSm, aeroDeadband, aPerDegASm, aReq, handoverFits ? "fits" : "COLLAPSE", angCapA, ang, adCancelActive ? 1 : 0));
+                        }
+                    }
                     steer = aeroTrimAtt + GetSteerCorrection(aeroErrSm, ang, angCapA, omegaLat);
-                    TagOwnerSteer("AD-glide");
+                    TagOwnerSteer(adCancelActive ? "AD-cancel" : "AD-glide");
                 }
 
                 double landingMinThrust, landingMaxThrust;
