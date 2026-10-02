@@ -1017,6 +1017,7 @@ namespace BoosterGuidance
         private double lastVhKillMeasT = -1;   // t of that sample
         private bool measWarmK = false;        // EMA has its first sample
         private double lastAppliedThrottleK = 0; // last tick's out (applied) throttle
+        private double lastTermVhFloorLogT = -100; // 批次六 V′-a floor log cadence
         private double lastV2gDbgT = -100;
         // f92 coast-translation floor: the suicide law manages VERTICAL speed
         // only, so the mid-burn coast (vy under the profile -> throttle ~0)
@@ -1865,6 +1866,63 @@ namespace BoosterGuidance
             return stopRatio <= 2.0;
         }
 
+        // 批次六 ③ X′ seeding fix (f274, user-approved 2026-10-02): one
+        // measurement step of the vh-kill EMA, factored pure for the
+        // TerminalCrossReplay gate. The EMA UPDATE keeps its dtK<5 guard; the
+        // SAMPLE STASH (prevVh/lastT) is the caller's job and must happen
+        // unconditionally - the f274 bug was the stash living inside the
+        // guard, so a cold lastT (-1) made dtK = t+1 >> 5 forever and the
+        // EMA never seeded (aMeasH = NaN all burn, ratio closure dead).
+        public static void VhKillMeasStep(double prevVh, double lastT, double vhNow, double t,
+            double aMeasPrev, bool warmPrev, out double aMeas, out bool warm)
+        {
+            aMeas = aMeasPrev;
+            warm = warmPrev;
+            double dtK = t - lastT;
+            if ((dtK > 1e-3) && (dtK < 5) && (prevVh >= 0))
+            {
+                double instK = (prevVh - vhNow) / dtK;
+                aMeas = warmPrev ? (aMeasPrev + (instK - aMeasPrev) * Math.Min(1, dtK / 1.0)) : instK;
+                warm = true;
+            }
+        }
+
+        // 批次六 ① 方案V′-a (f276/f277/f278/f279 touchdown tilt 8.0/6.8/8.2/
+        // 5.5 deg, 4/4 倾倒 - user: 触地 tilt>1° 必倒): terminal vh-deadline
+        // throttle floor. Below the terminal-protection height the suicide
+        // chop (0.9 -> 0.13-0.19) removes the thrust behind BOTH the TVC
+        // (attitude creep +2 deg/s at contact) and the retro-lean's lateral
+        // kill (vh 2-8 m/s at touchdown = the lean holds 8-15 deg of
+        // commanded tilt into the ground). The lean's lateral fraction is
+        // sin(lean) = vh/|vel_air - 20*up|, so the kill clock at throttle
+        // thr is |vel_air-20*up|/(thr*amax); holding it at tGo = y/|vy|
+        // prices the floor - the vh cancels (pure geometry, f135-clean).
+        // Capped at the hover line g/amax (f259 anti-hoist; the demand is
+        // self-extinguishing - vh<=1 releases the caller's gate - so the
+        // cap can never be pinned by a growing demand). Factored pure for
+        // the TerminalCrossReplay gate.
+        public static double TermVhFloor(double vh, double vy, double yG, double amax, double g, double minThrottle)
+        {
+            double tGoV = yG / Math.Max(2, -vy);
+            double raw = Math.Sqrt(vh * vh + (20 - vy) * (20 - vy)) / Math.Max(0.1, amax * tGoV);
+            return HGUtils.Clamp(raw, minThrottle, g / Math.Max(1, amax));
+        }
+
+        // 批次七 ② 方案Y′ (f279 axisMiss=190 m pinned the whole burn - the
+        // corr chased the FULL position error, dominated by the along-track
+        // part the vh-kill floor already owns, and delivered ~nothing
+        // perpendicular = nobody bent the velocity axis onto the pad):
+        // the velocity-perpendicular component of an error vector. The
+        // steer owns the axis-miss, the floor's throttle owns the stop
+        // along the axis (one owner per axis - f204/f205).
+        public static Vector3d AxisMissComponent(Vector3d error, Vector3d vhVec)
+        {
+            double vh = vhVec.magnitude;
+            if (vh < 1e-6) return error;
+            Vector3d vhHat = vhVec / vh;
+            return error - vhHat * Vector3d.Dot(error, vhHat);
+        }
+
         // 批次五 D2 (ad-lowalt-active-correction, user-approved 2026-10-02):
         // honesty certification for the AD low-altitude cancellation gate,
         // factored pure for the ADLowaltReplay gate. The smoothed error must
@@ -2177,6 +2235,7 @@ namespace BoosterGuidance
             {
                 prevVhMagK = -1;
                 measWarmK = false;
+                lastVhKillMeasT = -1; // 批次六 ③: the sample clock resets too - a stale clock spanned the non-LB gap into the dtK<5 guard (f274)
             }
 
             System.Diagnostics.Stopwatch timer = new System.Diagnostics.Stopwatch();
@@ -4375,15 +4434,18 @@ namespace BoosterGuidance
                             // real identically (f196), t clock throughout
                             // (f206). Seeds on the first sample after a
                             // non-LB phase (reset at the top of this method)
-                            double dtK = t - lastVhKillMeasT;
-                            if ((dtK > 1e-3) && (dtK < 5))
+                            // 批次六 ③ (f274: the stash sat INSIDE the dtK<5
+                            // guard - a cold lastT made dtK = t+1 >> 5
+                            // forever, the EMA never seeded, aMeasH read NaN
+                            // all burn and the ratio closure never engaged):
+                            // the EMA update keeps the guard (pure step
+                            // above), the SAMPLE STASH is unconditional -
+                            // a guarded-out tick still reseeds the clock
                             {
-                                if (prevVhMagK >= 0)
-                                {
-                                    double instK = (prevVhMagK - vhNow) / dtK;
-                                    aMeasHKill = measWarmK ? (aMeasHKill + (instK - aMeasHKill) * Math.Min(1, dtK / 1.0)) : instK;
-                                    measWarmK = true;
-                                }
+                                double aMeasStep; bool warmStep;
+                                VhKillMeasStep(prevVhMagK, lastVhKillMeasT, vhNow, t, aMeasHKill, measWarmK, out aMeasStep, out warmStep);
+                                aMeasHKill = aMeasStep;
+                                measWarmK = warmStep;
                                 prevVhMagK = vhNow;
                                 lastVhKillMeasT = t;
                             }
@@ -4787,6 +4849,41 @@ namespace BoosterGuidance
                                 coastTransGiveUp = false;
                             }
                         }
+                        // 批次六 ① 方案V′-a (user-approved 2026-10-02; f276/f277
+                        // TD tilt 8.0/6.8 deg still +2.0/+1.0 deg/s, f278/f279
+                        // 8.2/5.5 - 4/4 倾倒; user: 触地 tilt>1° 必倒): below
+                        // the terminal-protection height the suicide chop
+                        // (0.9 -> 0.13-0.19) removes the thrust behind BOTH
+                        // the TVC (tilt creeps monotonic, +2 deg/s at
+                        // contact) and the retro-lean's lateral kill (vh 2-8
+                        // at touchdown = the lean holds 8-15 deg of
+                        // commanded tilt into the ground). The corr-floor
+                        // (批次三 item 5) sits inside the yG>uprightHeight
+                        // block and cannot cover y<100 where the chop lives.
+                        // Deadline floor: hold the lean's own kill clock at
+                        // tGo (pure static above - vh cancels, f135-clean),
+                        // capped at the hover line (f259 anti-hoist). Max-
+                        // composed: the suicide law takes back over the
+                        // moment it wants more; burnLatMode==1 cannot occur
+                        // below V2gTermHeightEff (zxAlt) but the gate costs
+                        // nothing. Sim sees the same floor (f196); the
+                        // manual hand-over is auto-revoked below
+                        // uprightHeight (:4169) so no player conflict
+                        double vhTermV = Vector3d.Exclude(up, vel_air).magnitude;
+                        if ((yG < lowTiltCapHeight) && (yG > 0) && (vhTermV > 1) && (burnLatMode != 1))
+                        {
+                            double termFloor = TermVhFloor(vhTermV, vy, yG, amax, g, minThrottle);
+                            if (throttle < termFloor)
+                            {
+                                throttle = termFloor;
+                                TagOwner("term-vh-floor");
+                                if ((!simulate) && (t - lastTermVhFloorLogT > 5))
+                                {
+                                    lastTermVhFloorLogT = t;
+                                    Log.Info(string.Format("[LandingBurn] term-vh-floor: y={0:F0} vh={1:F1} vy={2:F1} -> thr={3:F2} (V′-a deadline floor - kill vh before touchdown, hover-capped)", yG, vhTermV, vy, throttle));
+                                }
+                            }
+                        }
                     }
                 }
                 // f237 (user-approved 2026-09-28 方案甲, SUPERSEDES the f236 方案B
@@ -4889,6 +4986,35 @@ namespace BoosterGuidance
                     // direction and hunts the attitude loop (flight 12 crash; flight 15
                     // final-phase wobble with velDamp=3 persisted from that build)
                     Vector3d errEff = error;
+                    // 批次七 ② 方案Y′ (user-approved 2026-10-02; f279
+                    // axisMiss=190 m PINNED the whole burn, f278 froze 345 m
+                    // short - the corr chased the FULL error, dominated by
+                    // the along-track part the vh-kill floor already owns
+                    // throttle-side, and delivered ~nothing perpendicular =
+                    // NOBODY bent the velocity axis onto the pad, f258
+                    // family): while the floor owns the along-track, the
+                    // correction's error vector is its velocity-PERPENDICULAR
+                    // component only - the steer bends the axis, the floor
+                    // rides the stop along it (one owner per axis -
+                    // f204/f205). Real gate = the floor latch; sim gate =
+                    // the floor's own deadband arithmetic inline (the latch
+                    // is real-only by design, f108) so sim flies what the
+                    // ship flies (f196). Floor silent (light hulls' proven
+                    // homing era) or AERO glide active (it owns its
+                    // engine-off homing, and errEff feeds its :5347 corr) =
+                    // the legacy full vector flies byte-identical. vh>5
+                    // keeps the axis well-defined
+                    if ((horizSpeed > 5) && (burnLatMode != 1))
+                    {
+                        bool floorOwnsAlong = vhKillLatched;
+                        if (simulate)
+                        {
+                            double remY = Vector3d.Dot(Vector3d.Exclude(up, tgt_r - r), Vector3d.Exclude(up, vel_air) / horizSpeed);
+                            floorOwnsAlong = (horizSpeed * horizSpeed / (2 * Math.Max(remY, 25))) >= vhKillDeadband;
+                        }
+                        if (floorOwnsAlong)
+                            errEff = AxisMissComponent(error, Vector3d.Exclude(up, vel_air));
+                    }
                     if ((landingBurnVelDamp > 0) && (horizSpeed < 50) && (error.magnitude > 1))
                     {
                         Vector3d phantom = landingBurnVelDamp * Vector3d.Exclude(up, vel_air);
