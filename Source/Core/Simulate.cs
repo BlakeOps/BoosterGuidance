@@ -11,6 +11,17 @@ namespace BoosterGuidance
         static float dt_reentry = 2; // used before reentry
         static float dt_aero = 4;
 
+        // 批次九-A (user-approved 2026-10-02): Simulate.dat v2 column manifest -
+        // emitted verbatim into each run's header so parsers never hardcode
+        // positions; row writes MUST follow this order exactly. Same self-
+        // describing convention as the Actual.dat v2 manifest (flight-logging-v2).
+        // aeroH/thrH are SIGNED along-track-horizontal accelerations (negative =
+        // braking), aeroV/thrV signed along +up - the per-tick aero-vs-thrust
+        // delivery decomposition the f283 run-#6 forensic needed. Zero control
+        // change: pure readout of quantities EulerStep already computes.
+        private const string SimV2Columns =
+            "t x y z vx vy vz aeroH aeroV thrH thrV throttle tiltDeg phase owner target_error total_mass";
+
         double MinHeightAtMinThrust(double y, double vy, double amin, double g)
         {
             double minHeight = 0;
@@ -34,7 +45,8 @@ namespace BoosterGuidance
                 BLController controller, Vector3d tgt_r, double aeroFudgeFactor,
                 out Vector3d steer,
                 out Vector3d vel_air, out double throttle,
-                out Vector3d out_r, out Vector3d out_v)
+                out Vector3d out_r, out Vector3d out_v,
+                out Vector3d aeroA, out Vector3d thrustA)
         {
             double y = r.magnitude - body.Radius;
             steer = -Vector3d.Normalize(v);
@@ -132,6 +144,12 @@ namespace BoosterGuidance
             Vector3d F = Fa * aeroFudgeFactor + Ft;
             Vector3d a = F / totalMass + g;
 
+            // 批次九-A: per-tick APPLIED force decomposition for the sim v2 log
+            // (aero post-calibration INCLUDING aeroFudgeFactor, thrust at the
+            // controller-commanded throttle) - readout only, F/a untouched
+            aeroA = Fa * aeroFudgeFactor / totalMass;
+            thrustA = Ft / totalMass;
+
             out_r = r + v * dt + 0.5 * a * dt * dt;
             out_v = v + a * dt;
         }
@@ -200,14 +218,18 @@ namespace BoosterGuidance
             Quaternion bodyRotation;
             if (Utils.LoggingActive &&  logtype != Utils.LogType.none)
             {
-                Utils.Log(logtype, "time x y z vx vy vz ax ay az att_err target_error total_mass");
+                // 批次九-A: each logged run re-emits the self-describing v2
+                // header - the file is multi-run, so the header doubles as the
+                // run delimiter (parsers split runs on "# format v2")
+                Utils.Log(logtype, "# format v2");
+                Utils.Log(logtype, "# build " + BLController.BuildMd5_8());
+                Utils.Log(logtype, "# columns " + SimV2Columns);
                 Utils.Log(logtype, "# tgtAlt=" + tgtAlt);
             }
 
             T = 0;
             Vector3d r = (startR.HasValue) ? startR.Value : vessel.GetWorldPos3D() - body.position;
             Vector3d v = (startV.HasValue) ? startV.Value : vessel.GetObtVelocity();
-            Vector3d a = Vector3d.zero;
             Vector3d last_r = r;
             Vector3d last_v = v;
             BLControllerPhase last_phase = controller.phase;
@@ -266,8 +288,27 @@ namespace BoosterGuidance
                 if ((controller.phase == BLControllerPhase.AeroDescent) || (controller.phase == BLControllerPhase.LandingBurn))
                     dt = Math.Min(dt_aero, dt_max);
 
+                if ((y < body.atmosphereDepth) || (y < controller.reentryBurnAlt + 1500 * dt))
+                    dt = Math.Min(dt, 2);
+
+                Vector3d vel_air;
+                Vector3d steer;
+                double throttle;
+                double aeroFudgeFactor = 1.05; // Assume aero forces 5% higher which causes overshoot of target and more vertical final descent
+                Vector3d out_r;
+                Vector3d out_v;
+                Vector3d aeroA;
+                Vector3d thrustA;
+                // Compute time step change in r and v
+                BLControllerPhase preStepPhase = controller.phase; // 思路1: handover capture needs the pre-step phase
+                EulerStep(dt, vessel, r, v, att, totalMass, minThrust, maxThrust, aeroModel, body, T, controller, tgt_r, aeroFudgeFactor, out steer, out vel_air, out throttle, out out_r, out out_v, out aeroA, out thrustA);
+
                 if (Utils.LoggingActive && logtype != Utils.LogType.none)
                 {
+                    // 批次九-A v2 row: logged AFTER the step so the per-tick
+                    // delivery decomposition (aero vs thrust, H/V) rides along.
+                    // r/v are still the STEP-START state (updated below) - t/x/v
+                    // stay comparable with legacy rows
                     // NOTE: Cancel out rotation of planet
                     ang = (float)((-T) * body.angularVelocity.magnitude / Math.PI * 180.0);
                     // Rotation 1 second earlier
@@ -278,25 +319,25 @@ namespace BoosterGuidance
                     Vector3d tr = bodyRotation * r;
                     Vector3d tr1 = prevbodyRotation * r;
                     Vector3d tr2 = bodyRotation * (r + v);
-                    Vector3d ta = bodyRotation * a;
                     tr = logTransform.InverseTransformPoint(tr + body.position);
                     Vector3d tv = logTransform.InverseTransformVector(tr2 - tr1);
-                    ta = logTransform.InverseTransformVector(ta);
-                    Utils.Log(logtype, string.Format("{0} {1:F5} {2:F5} {3:F5} {4:F5} {5:F5} {6:F5} {7:F1} {8:F1} {9:F1} 0 {10:F2} {11:F2}", T + timeOffset, tr.x, tr.y, tr.z, tv.x, tv.y, tv.z, ta.x, ta.y, ta.z, targetError, totalMass));
+                    // signed decomposition: H along the horizontal-velocity
+                    // direction (negative = braking), V along +up. NaN when the
+                    // horizontal speed is ~0 (terminal hover: H is undefined,
+                    // not zero)
+                    Vector3d upS = Vector3d.Normalize(r);
+                    Vector3d vhVecS = Vector3d.Exclude(upS, vel_air);
+                    bool vhOk = vhVecS.magnitude > 0.5;
+                    Vector3d vhHat = vhOk ? Vector3d.Normalize(vhVecS) : Vector3d.zero;
+                    double aeroH = vhOk ? Vector3d.Dot(aeroA, vhHat) : double.NaN;
+                    double aeroV = Vector3d.Dot(aeroA, upS);
+                    double thrH = vhOk ? Vector3d.Dot(thrustA, vhHat) : double.NaN;
+                    double thrV = Vector3d.Dot(thrustA, upS);
+                    double tiltS = HGUtils.angle_between(steer, upS);
+                    string ownerS = (controller.SteerOwnerTick != null) ? controller.SteerOwnerTick : controller.phase.ToString();
+                    Utils.Log(logtype, string.Format("{0:F2} {1:F5} {2:F5} {3:F5} {4:F5} {5:F5} {6:F5} {7:F2} {8:F2} {9:F2} {10:F2} {11:F3} {12:F1} {13} {14} {15:F2} {16:F2}",
+                        T + timeOffset, tr.x, tr.y, tr.z, tv.x, tv.y, tv.z, aeroH, aeroV, thrH, thrV, throttle, tiltS, controller.phase, ownerS, targetError, totalMass));
                 }
-
-                if ((y < body.atmosphereDepth) || (y < controller.reentryBurnAlt + 1500 * dt))
-                    dt = Math.Min(dt, 2);
-
-                Vector3d vel_air;
-                Vector3d steer;
-                double throttle;
-                double aeroFudgeFactor = 1.05; // Assume aero forces 5% higher which causes overshoot of target and more vertical final descent
-                Vector3d out_r;
-                Vector3d out_v;
-                // Compute time step change in r and v
-                BLControllerPhase preStepPhase = controller.phase; // 思路1: handover capture needs the pre-step phase
-                EulerStep(dt, vessel, r, v, att, totalMass, minThrust, maxThrust, aeroModel, body, T, controller, tgt_r, aeroFudgeFactor, out steer, out vel_air, out throttle, out out_r, out out_v);
 
                 if (throttle > 0)
                 {

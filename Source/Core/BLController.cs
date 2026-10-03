@@ -574,6 +574,7 @@ namespace BoosterGuidance
         // aTot EMA is a SEPARATE instance from every control filter; f206:
         // dt-normalized on the mission t-clock, never Time.deltaTime).
         private string steerOwnerTick = null;   // D4 coarse owner tag, reset per tick
+        public string SteerOwnerTick { get { return steerOwnerTick; } } // 批次九-A: Simulate.dat v2 owner column (read-only; instrumentation otherwise write-only)
         private void TagOwner(string tag) { steerOwnerTick = tag; }                        // floors/events: unconditional
         private void TagOwnerSteer(string tag) { if (steerOwnerTick == null) steerOwnerTick = tag; } // steer laws yield to floors
         private double lastALatReqLog = double.NaN;   // brake-budget triple, stashed in the vh-kill floor block
@@ -1630,7 +1631,7 @@ namespace BoosterGuidance
         // process so every v2 log header self-identifies the build that flew it
         // (flight-logging-v2 D2; replaces the post-flight MD5-verification ritual).
         private static string buildMd5_8 = null;
-        private static string BuildMd5_8()
+        public static string BuildMd5_8() // 批次九-A: public so Simulate can self-identify its v2 headers too
         {
             if (buildMd5_8 == null)
             {
