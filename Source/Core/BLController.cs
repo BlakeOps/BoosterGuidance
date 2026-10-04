@@ -431,6 +431,28 @@ namespace BoosterGuidance
         // transition between "slam can still kill" and "glide must walk it
         // back") — not a new fitted number.
         private const double vhKillReleaseVh = 12;
+        // 批次十三 方案2 (分析结论, 非用户原话): the f236/f237 lateral-accel
+        // cap was tuned at the 700 red-mark ship's mass (~700 t). Its 3 m/s^2
+        // equals ~7.5% of that ship's thrust authority. A lighter ship at the
+        // same 3 m/s^2 cap has proportionally MORE angle authority consumed
+        // per unit of correction, so it cannot correct large lateral offsets
+        // in the remaining LB time (same failure the fixed AoA schedule has,
+        // 方案1 — the light ship needs MORE tilt authority than the heavy).
+        //
+        // Mass-aware formulation: cap scales inversely with ship mass,
+        // anchored at the design-point mass:
+        //   capLat = pumpLevel * max(1, refMass / totalMass)
+        // Heavy ships (totalMass >= refMass) keep 3 m/s^2 (no regression).
+        // Light ships get more: 200t -> 10.5, 400t -> 5.25, etc. The ratio
+        // capLat / (thrustAuthority) stays fixed at 7.5%, so the safety
+        // margin vs the pump level is preserved at any mass.
+        //
+        // NOT a fitted constant: refMass=700000 is the actual mass of the
+        // ship where the 3 m/s^2 cap was first measured and hardened (the
+        // 700 red-mark flight); the pump level 3 is the f33/f34 oscillation
+        // amplitude divided by a 5x safety factor. Both are flight data.
+        private const double lateralCapRefMass = 700000;
+        private const double lateralCapPumpLevel = 3;
         // f127: horizontal-kill-aware ignition - m of extra ignition height
         // per m/s of horizontal speed, applied ONLY when the natural
         // (vertical-energy) burn height sits below the low-AoA-cap line
@@ -5152,9 +5174,11 @@ namespace BoosterGuidance
                         // disturbs the horizontal fix. Same cap at the
                         // y<=noSteerHeight starship call site below
                         double aThrustNow = throttle * amax;
-                        if ((aThrustNow > 3) && (corrS.magnitude > 1e-9))
+                        // 批次十三 方案2: mass-aware lateral cap
+                        double capLatS = HGUtils.Clamp(lateralCapPumpLevel * Math.Max(1, lateralCapRefMass / totalMass), 1, 30);
+                        if ((aThrustNow > capLatS) && (corrS.magnitude > 1e-9))
                         {
-                            double allowedS = Math.Asin(HGUtils.Clamp(3 / aThrustNow, 0, 1));
+                            double allowedS = Math.Asin(HGUtils.Clamp(capLatS / aThrustNow, 0, 1));
                             if (corrS.magnitude > allowedS)
                                 corrS = Vector3d.Normalize(corrS) * allowedS;
                         }
@@ -5692,9 +5716,11 @@ namespace BoosterGuidance
                     // no bind); ConeGuard works at low throttle where the cap
                     // barely binds (thr*amax small -> allowed angle large)
                     double aThrustF = throttle * amax;
-                    if ((aThrustF > 3) && (corr.magnitude > 1e-9))
+                    // 批次十三 方案2: mass-aware lateral cap
+                    double capLatF = HGUtils.Clamp(lateralCapPumpLevel * Math.Max(1, lateralCapRefMass / totalMass), 1, 30);
+                    if ((aThrustF > capLatF) && (corr.magnitude > 1e-9))
                     {
-                        double allowedF = Math.Asin(HGUtils.Clamp(3 / aThrustF, 0, 1));
+                        double allowedF = Math.Asin(HGUtils.Clamp(capLatF / aThrustF, 0, 1));
                         if (corr.magnitude > allowedF)
                             corr = Vector3d.Normalize(corr) * allowedF;
                     }
@@ -5729,9 +5755,11 @@ namespace BoosterGuidance
                         // throttle, so an uncapped angle here is exactly the
                         // f236 pump): throttle*amax*sin(|corr|) <= 3 m/s2
                         double aThrustB = throttle * amax;
-                        if ((aThrustB > 3) && (corrB.magnitude > 1e-9))
+                        // 批次十三 方案2: mass-aware lateral cap
+                        double capLatB = HGUtils.Clamp(lateralCapPumpLevel * Math.Max(1, lateralCapRefMass / totalMass), 1, 30);
+                        if ((aThrustB > capLatB) && (corrB.magnitude > 1e-9))
                         {
-                            double allowedB = Math.Asin(HGUtils.Clamp(3 / aThrustB, 0, 1));
+                            double allowedB = Math.Asin(HGUtils.Clamp(capLatB / aThrustB, 0, 1));
                             if (corrB.magnitude > allowedB)
                                 corrB = Vector3d.Normalize(corrB) * allowedB;
                         }
@@ -5769,9 +5797,11 @@ namespace BoosterGuidance
                         // bound - vertical braking must not disturb the
                         // horizontal fix
                         double aThrustF2 = throttle * amax;
-                        if ((aThrustF2 > 3) && (corrF.magnitude > 1e-9))
+                        // 批次十三 方案2: mass-aware lateral cap
+                        double capLatF2 = HGUtils.Clamp(lateralCapPumpLevel * Math.Max(1, lateralCapRefMass / totalMass), 1, 30);
+                        if ((aThrustF2 > capLatF2) && (corrF.magnitude > 1e-9))
                         {
-                            double allowedF2 = Math.Asin(HGUtils.Clamp(3 / aThrustF2, 0, 1));
+                            double allowedF2 = Math.Asin(HGUtils.Clamp(capLatF2 / aThrustF2, 0, 1));
                             if (corrF.magnitude > allowedF2)
                                 corrF = Vector3d.Normalize(corrF) * allowedF2;
                         }
