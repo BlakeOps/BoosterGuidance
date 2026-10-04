@@ -4304,6 +4304,25 @@ namespace BoosterGuidance
                     // kick tilt at y~12km (aPerDeg 0.5-0.9, real usable
                     // force) to collapse the error 161->84 in 1.3s while the
                     // pinned 7deg cap held the guidance to a 2-4 m/s walk.
+                    // 批次十五 (user-approved 2026-10-05): the authority-scaled
+                    // ceiling is DELETED - it priced the cap FORWARD in the
+                    // measured gain (cap = 7*gain/0.15), which is the mass
+                    // direction backwards: the light hull (big per-degree
+                    // force, 178t: gain 1.4-4.1 below 15km) got the 25deg
+                    // ceiling it never needs, while the heavy hull (1194t:
+                    // gain 0.5 at 20km) was pinned at 15-23deg with demands
+                    // sitting at 100+deg - the cap blocked exactly the aero
+                    // authority the heavy hull lives on (2026-10-04 flight
+                    // group B/C, user: 重船的气动被阻碍). The cap's only job
+                    // is the hull SAFETY envelope, so it is the panel hull
+                    // limit through the flight-16 altitude ramp
+                    // (EffectiveMaxAoA, assigned above) for every hull,
+                    // measured or not - the same trust-the-panel policy the
+                    // landing burn's EffectiveMaxAoALB uses. The measured
+                    // gain keeps its proper job: pricing the DEMAND angle
+                    // (ang = aReq/aPerDeg below) - big gain -> small demand,
+                    // small gain -> big demand, the mass direction the cap
+                    // formula had inverted.
                     double angCapA = EffectiveMaxAoA(aeroDescentMaxAoA, y);
                     double sFAa, sFTa;
                     // f243 方案三 (user proposal 2026-09-29): probe around the
@@ -4325,9 +4344,7 @@ namespace BoosterGuidance
                     else aPerDegASm += (aPerDegRawA - aPerDegASm) * HGUtils.Clamp(dtLA / 3.0, 0, 1);
                     double tGoA = yG / Math.Max(50, -vy);
                     double vDesA = HGUtils.Clamp(error.magnitude / tGoA, 2, 8);
-                    bool capMeasured = aPerDegASm > 0.001;
-                    if (capMeasured)
-                        angCapA = HGUtils.Clamp(7.0 * aPerDegASm / 0.15, 7, 25);
+                    bool capMeasured = aPerDegASm > 0.001;   // 批次十五: measured gain prices the DEMAND only (ang below); the cap is always the hull schedule above
                     // 丙 (batch-2, user-approved 2026-10-01, f267 root): the
                     // PID's kp collapses with 1/q exactly when the late glide
                     // needs the demand (f267: kp 14.4 -> 0.21). When measured
@@ -4349,7 +4366,7 @@ namespace BoosterGuidance
                     if (t - lastAeroCapLogT > 5)
                     {
                         lastAeroCapLogT = t;
-                        Log.Info(string.Format("[AeroDescent] ADAPT CAP: t={0:F1} y={1:F0} err={2:F0} errSm={3:F0} db={4:F0} aPerDeg={5:F4} vDes={6:F1} tGo={7:F0} cap={8:F1}{9} ang={10:F1} os={11}", t, yG, error.magnitude, errSmMag, aeroDeadband, aPerDegASm, vDesA, tGoA, angCapA, capMeasured ? " (measured)" : " (static fallback)", ang, aeroOsStreak));
+                        Log.Info(string.Format("[AeroDescent] ADAPT CAP: t={0:F1} y={1:F0} err={2:F0} errSm={3:F0} db={4:F0} aPerDeg={5:F4} vDes={6:F1} tGo={7:F0} cap={8:F1}{9} ang={10:F1} os={11}", t, yG, error.magnitude, errSmMag, aeroDeadband, aPerDegASm, vDesA, tGoA, angCapA, capMeasured ? " (hull-cap, meas-demand)" : " (hull-cap, pid-demand)", ang, aeroOsStreak));
                     }
                     // f243 方案三: steer = MEASURED retrograde baseline + corr
                     // (baseline learns the hull's real attitude while the
