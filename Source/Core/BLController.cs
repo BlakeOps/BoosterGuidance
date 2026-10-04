@@ -754,6 +754,25 @@ namespace BoosterGuidance
         public double aeroCalLift = 1; // realized/model lift ratio (EMA)
         public double aeroCalDrag = 1; // realized/model drag ratio (EMA)
         public double aeroCalRate = 0.02; // EMA gain per tick (~1s at 50Hz)
+        // 批次十三 方案3 (分析结论, 非用户原话): the V-solution (ReentryBurn
+        // own-speed solve vStar) predicts the LB handover via the sim, which
+        // applies EffectiveCalLift/Drag. The calibration is only sampled
+        // during BellyFlop engine-off (throttle=0), so during the RB itself
+        // no fresh measurements are available. In a fast-approach scenario
+        // the first BellyFlop after RB (the AeroDescent high-q 85-deg brake)
+        // is when the V-solution most needs an up-to-date calibration - but
+        // the nominal 0.02/tick rate takes ~25s to converge 80% on a step,
+        // which is most of the AD window. Faster convergence for the first
+        // 5s after the RB→AD transition gets 80% convergence in ~5s, so the
+        // subsequent RB re-solves (vStar updates each tick while burnDone=0)
+        // price the REAL realized ratio instead of the stale seed.
+        // Window: 5s (the AD regime's first steady samples before AoA
+        // collapses to glide; the rate reverts to nominal after so the
+        // long-run steady state is unchanged - no regression for the rest
+        // of the descent).
+        private const double aeroCalRateFast = 0.1;
+        private const double aeroCalFastWindowSec = 5;
+        private double rbAdEntryT = -1; // time of the last RB->AD transition
         // f64: a single kL/kD cannot fit the whole descent - the measured
         // truth walked 1.53 (q~2kPa) -> 0.9 (q~15kPa) -> 2.33 (low alt,
         // brakes out) in ONE flight, every EMA update moved the predicted
@@ -832,6 +851,21 @@ namespace BoosterGuidance
         // lies exactly on the drag axis and cannot be split out)
         public double[] aeroCalLiftAbQ = new double[3] { 1, 1, 1 };
         public int[] aeroCalSamplesAbQ = new int[3] { 0, 0, 0 };
+        // 批次十三 方案3 (分析结论): the starship fast-approach scenario
+        // flies ReentryBurn -> AeroDescent -> LandingBurn, never entering
+        // BellyFlop. The glide-regime calibration (aeroCalLift/Drag sampled
+        // in BF with aoa<=45) does not cover the AeroDescent brake regime
+        // (aoa~85°, dense high-q), and the cache's drag model for that
+        // regime has a systematic underestimate (the user's diagnosis:
+        // 预测阻力偏小 → 预测进场速度偏高 → LB 多烧燃料). Open a separate
+        // scalar channel for the AD brake regime - it samples AD only, with
+        // the fast-EMA rate (aeroCalRateFast) applied in the first 5s
+        // after RB->AD so the V-solution prediction uses the realized
+        // drag ratio instead of the stale cache. The glide channel is
+        // untouched (BF-only samples continue as before).
+        public double aeroCalLiftAd = 1;
+        public double aeroCalDragAd = 1;
+        public int aeroCalSamplesAd = 0;
         // Set on SIM CLONES from the live airbrakeWanted (copy ctor): the
         // boards stay out for the rest of a braking descent, so a braking
         // prediction must integrate the boards-out lift bands it is
@@ -908,6 +942,22 @@ namespace BoosterGuidance
                 return aeroCalDrag;
             if (aeroCalSamplesQ[b] >= calBinMinSamples)
                 return aeroCalDragQ[b];
+            return aeroCalDrag;
+        }
+        // 批次十三 方案3: AeroDescent brake-regime channel reader. Returns the
+        // AD-specific EMA value once it has a minimum number of samples
+        // (calBinMinSamples reused for consistency), otherwise the glide
+        // global as a fallback.
+        public double EffectiveCalLiftAd()
+        {
+            if (aeroCalSamplesAd >= calBinMinSamples)
+                return aeroCalLiftAd;
+            return aeroCalLift;
+        }
+        public double EffectiveCalDragAd()
+        {
+            if (aeroCalSamplesAd >= calBinMinSamples)
+                return aeroCalDragAd;
             return aeroCalDrag;
         }
         private Vector3d calPrevV = Vector3d.zero;
@@ -1320,6 +1370,9 @@ namespace BoosterGuidance
             aeroLiveCal = v.aeroLiveCal;
             aeroCalLift = v.aeroCalLift;
             aeroCalDrag = v.aeroCalDrag;
+            aeroCalLiftAd = v.aeroCalLiftAd;
+            aeroCalDragAd = v.aeroCalDragAd;
+            aeroCalSamplesAd = v.aeroCalSamplesAd;
             // f65: clone only healthy bins - a corrupt (len!=3) source would
             // otherwise spread into every per-refresh sim copy
             aeroCalLiftQ = ((v.aeroCalLiftQ != null) && (v.aeroCalLiftQ.Length == 3)) ? (double[])v.aeroCalLiftQ.Clone() : new double[3] { 1, 1, 1 };
@@ -2153,8 +2206,11 @@ namespace BoosterGuidance
             double gHere = body.gravParameter / (r.magnitude * r.magnitude);
 
             // 当前调度角度的阻力减速 (用实测比率 aeroCalDrag 修正模型)
+            // 批次十二 hotfix: 阻力沿 dragAxis(=-velN) 的投影为正 (阻力与
+            // dragAxis 同向), 这里取正号才是正的减速幅值; 此前的负号让
+            // aDragNow 恒为负 -> 恒 <= gHere -> cap 永不生效。
             Vector3d forceNow = aeroModel.GetForces(body, r, vel_air, aoaScheduled * deg2rad);
-            double aDragNow = -Vector3d.Dot(forceNow, dragAxis) / totalMass * aeroCalDrag;
+            double aDragNow = Vector3d.Dot(forceNow, dragAxis) / totalMass * aeroCalDrag;
 
             if (aDragNow <= gHere)
                 return aoaScheduled; // cap 不生效
@@ -2167,7 +2223,7 @@ namespace BoosterGuidance
             {
                 double mid = (loA + hiA) * 0.5;
                 Vector3d fMid = aeroModel.GetForces(body, r, vel_air, mid * deg2rad);
-                double aMid = -Vector3d.Dot(fMid, dragAxis) / totalMass * aeroCalDrag;
+                double aMid = Vector3d.Dot(fMid, dragAxis) / totalMass * aeroCalDrag;
                 if (Math.Abs(aMid - gHere) < 0.05) { hiA = mid; break; } // 0.05 m/s² 精度足够
                 if (aMid < gHere) loA = mid; else hiA = mid;
             }
@@ -2335,6 +2391,11 @@ namespace BoosterGuidance
                 measWarmK = false;
                 lastVhKillMeasT = -1; // 批次六 ③: the sample clock resets too - a stale clock spanned the non-LB gap into the dtK<5 guard (f274)
             }
+            // 批次十三 方案3: the fast-convergence window is AD-only (the
+            // dense high-q brake regime right after RB); reset when leaving
+            // AeroDescent so a later entry earns its own window
+            if (phase != BLControllerPhase.AeroDescent)
+                rbAdEntryT = -1;
 
             System.Diagnostics.Stopwatch timer = new System.Diagnostics.Stopwatch();
             timer.Start();
@@ -2379,6 +2440,9 @@ namespace BoosterGuidance
                 {
                     double qCal = DynamicPressure(y, vel_air.magnitude, body);
                     double aoaCal = BellyAoADegCapped(qCal, Vector3d.Exclude(up, vel_air).magnitude, PathDownDeg(vel_air, up), totalMass, vel_air, r, body); // 批次十二: 与飞行的 capped 角度一致
+                    // 批次十三 方案3: faster convergence for the first 5s
+                    // after the RB->BF transition (V-solution freshness)
+                    double calRateNow = ((rbAdEntryT >= 0) && (t - rbAdEntryT < aeroCalFastWindowSec)) ? aeroCalRateFast : aeroCalRate;
                     if ((qCal > 200) && (aoaCal <= 45))
                     {
                         Vector3d aeroReal = (v - calPrevV) / calDt - r * (-body.gravParameter / (r.magnitude * r.magnitude * r.magnitude));
@@ -2423,9 +2487,9 @@ namespace BoosterGuidance
                             if ((dM > 0.2) && (dR > 0) && (!airbrakeOutPrev))
                             {
                                 double kd = HGUtils.Clamp(dR / dM, 0.3, 3);
-                                aeroCalDrag += aeroCalRate * (kd - aeroCalDrag);
+                                aeroCalDrag += calRateNow * (kd - aeroCalDrag);
                                 if (binOk)
-                                    aeroCalDragQ[calBin] += aeroCalRate * (kd - aeroCalDragQ[calBin]);
+                                    aeroCalDragQ[calBin] += calRateNow * (kd - aeroCalDragQ[calBin]);
                                 sampled = true;
                             }
                             // kL samples with or without brakes (f66, user
@@ -2446,9 +2510,9 @@ namespace BoosterGuidance
                                 double kl = HGUtils.Clamp(lR / lM, 0.3, 3);
                                 if (!airbrakeOutPrev)
                                 {
-                                    aeroCalLift += aeroCalRate * (kl - aeroCalLift);
+                                    aeroCalLift += calRateNow * (kl - aeroCalLift);
                                     if (binOk)
-                                        aeroCalLiftQ[calBin] += aeroCalRate * (kl - aeroCalLiftQ[calBin]);
+                                        aeroCalLiftQ[calBin] += calRateNow * (kl - aeroCalLiftQ[calBin]);
                                     sampled = true;
                                 }
                                 // f82: boards-out lift only counts in the pure
@@ -2464,7 +2528,7 @@ namespace BoosterGuidance
                                 // 8-11 km overshoot redeploy at 24 km
                                 else if ((binOk) && (aoaCal <= 25))
                                 {
-                                    aeroCalLiftAbQ[calBin] += aeroCalRate * (kl - aeroCalLiftAbQ[calBin]);
+                                    aeroCalLiftAbQ[calBin] += calRateNow * (kl - aeroCalLiftAbQ[calBin]);
                                     sampled = true;
                                 }
                             }
@@ -6432,6 +6496,14 @@ namespace BoosterGuidance
             // So the logging is done at the start of the new phase
             if ((lastPhase != phase) && (Utils.LoggingActive) && (!simulate))
                 LogSimulation();
+            // 批次十三 方案3: stamp the time the last RB->BF transition
+            // happened (real flight only - the sim doesn't sample). Used
+            // by the aero-cal block to run a faster EMA for the first 5s
+            // of BellyFlop after the reentry burn, so the V-solution's
+            // prediction sim prices the realized ratio instead of the
+            // stale seed when the AD regime's steady samples arrive
+            if ((lastPhase == BLControllerPhase.ReentryBurn) && (phase == BLControllerPhase.AeroDescent) && (!simulate))
+                rbAdEntryT = t;
 
             elapsed_secs = timer.ElapsedMilliseconds * 0.001;
 
