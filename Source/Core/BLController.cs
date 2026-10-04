@@ -416,6 +416,19 @@ namespace BoosterGuidance
         // 0.6) - see the floor-block comment; kills the 5 Hz bang-bang that
         // halved lateral authority and put the 3.75m into the launch tower
         private const double vhKillDeadbandRelease = 0.6;
+        // 批次十一 (user-approved 2026-10-04): sustained authority floor.
+        // The exact-stop taper (aLatStop = vh²/(2·rem)) collapses thr to
+        // ~0.01 by vh≈27, which on the 700 red-mark flight let attErr blow
+        // from 1.6° to 67° in 1 s (engine gated off by Core's 10° steer
+        // gate) and handed a residual vh=27 to an engine-off glide that
+        // then drifted 295→650 m and toppled. Hold thr >= this floor while
+        // vh is above vhKillReleaseVh so the tail-sitter keeps authority.
+        private const double sustainedAuthorityFloor = 0.5;
+        // Release threshold: the floor may taper/release only once vh has
+        // dropped to this value. 12 = the f224 boundary (flight-proven
+        // transition between "slam can still kill" and "glide must walk it
+        // back") — not a new fitted number.
+        private const double vhKillReleaseVh = 12;
         // f127: horizontal-kill-aware ignition - m of extra ignition height
         // per m/s of horizontal speed, applied ONLY when the natural
         // (vertical-energy) burn height sits below the low-AoA-cap line
@@ -916,6 +929,16 @@ namespace BoosterGuidance
         // machine is real-flight only) - the sim path keeps the f219
         // slam law unchanged
         private bool overshootGlide = false;
+        // 批次十一 (lb-brake-early-high-throttle, user-approved 2026-10-04):
+        // sustained authority floor — keep throttle >= 0.5 while vh > 12,
+        // so attitude authority is preserved through the taper window.
+        // Plus Trajectories prediction counter-effect safety release.
+        private bool authorityFloorLatch = false;
+        private bool trajCounterEffectTriggered = false;
+        private double[] trajPredDistWindow = new double[5];
+        private int trajPredDistWindowIdx = 0;
+        private int trajPredDistWindowCount = 0;
+        private double trajCounterEffectLogT = -100;
         // f189 方案B/C (user-approved): kp-fallback hysteresis latch +
         // health timer (powered steer branch), and the PlanJump diagnostic
         // state (pred site)
@@ -2424,6 +2447,13 @@ namespace BoosterGuidance
                 aPerDegWSm = -1;
                 profileDemandLB = 0;
                 manualLandActive = false; // f196: the record hand-over lives only inside LandingBurn too
+                // 批次十一: the authority floor + counter-effect latches are
+                // per-burn — a later burn (or second landing) starts clean
+                authorityFloorLatch = false;
+                trajCounterEffectTriggered = false;
+                trajPredDistWindowIdx = 0;
+                trajPredDistWindowCount = 0;
+                trajCounterEffectLogT = -100;
             }
             // f238 方案: same hygiene for the AeroDescent adaptive-cap state
             if (phase != BLControllerPhase.AeroDescent)
@@ -4646,10 +4676,29 @@ namespace BoosterGuidance
                                     vhKillDbPass = aLatReq >= vhKillDeadband;
                                 else
                                 {
-                                    if (aLatReq >= vhKillDeadband)
+                                    // 批次十一: tighten the release condition
+                                    // — the floor releases only when vh has
+                                    // genuinely shrunk below the small-vh
+                                    // threshold (vhKillReleaseVh = 12, f224
+                                    // boundary), OR the Trajectories counter-
+                                    // effect flag fires (unconditional
+                                    // override). The old pure-deadband release
+                                    // let the floor go silent at vh=27 and
+                                    // hand a residual 27 m/s to an engine-off
+                                    // glide that then drifted 295→650 m and
+                                    // toppled (700 red-mark, batch 10)
+                                    bool wasLatchedHK = vhKillLatched;
+                                    if (trajCounterEffectTriggered)
+                                        vhKillLatched = false; // counter-effect: immediate unconditional release
+                                    else if (aLatReq >= vhKillDeadband)
                                         vhKillLatched = true;
-                                    else if (aLatReq < vhKillDeadbandRelease)
+                                    else if ((aLatReq < vhKillDeadbandRelease) && (vhNow <= vhKillReleaseVh))
                                         vhKillLatched = false;
+                                    if (wasLatchedHK && (!vhKillLatched) && (t - lastVhKillLogT > 5))
+                                    {
+                                        lastVhKillLogT = t;
+                                        Log.Info(string.Format("[LandingBurn] vh-kill floor RELEASE: vh={0:F1} y={1:F0} aLatR={2:F2} thr={3:F2} attErr={4:F1} reason={5} (批次十一 - 小 vh 才交棒)", vhNow, yG, aLatReq, throttle, attErrPrevTick, trajCounterEffectTriggered ? "counter-effect" : "vh<=" + ((int)vhKillReleaseVh)));
+                                    }
                                     vhKillDbPass = vhKillLatched;
                                 }
                                 if (vhKillDbPass)
@@ -4674,6 +4723,75 @@ namespace BoosterGuidance
                                     vhKillFloor = HGUtils.Clamp(lastAppliedThrottleK * aLatReq / aMeasHKill, minThrottle, 1);
                                 else
                                     vhKillFloor = HGUtils.Clamp(aLatReq / Math.Max(0.1, aLatFull), minThrottle, 1);
+                                // 批次十一: sustained authority floor — while vh is
+                                // still above the small-vh release threshold, the
+                                // exact-stop taper may not drop the commanded
+                                // throttle below sustainedAuthorityFloor (0.5).
+                                // The taper's aLatStop = vh²/(2·rem) collapses thr
+                                // to ~0.01 by vh≈27, which lost the tail-sitter's
+                                // attitude authority (700 red-mark: attErr 1.6°→67°
+                                // in 1 s, engine gated off by Core's 10° steer
+                                // gate, residual vh=27 handed to an engine-off
+                                // glide → 295→650 m drift → topple). The clamp is
+                                // real-flight only (sim keeps the replay law),
+                                // skipped on overshoot (f220 glide regime must stay
+                                // engine-off; slamCut would otherwise re-light the
+                                // engine), and disabled once the counter-effect
+                                // flag fires.
+                                double legacyVhKillFloor = vhKillFloor;
+                                if ((!simulate) && (!overshotHK) && (!trajCounterEffectTriggered) && (vhNow > vhKillReleaseVh))
+                                    vhKillFloor = Math.Max(vhKillFloor, sustainedAuthorityFloor);
+                                if ((!simulate) && (!authorityFloorLatch) && (vhKillFloor > legacyVhKillFloor))
+                                {
+                                    authorityFloorLatch = true;
+                                    Log.Info(string.Format("[LandingBurn] vh-kill AUTHORITY-FLOOR engaged: vh={0:F0} y={1:F0} thr={2:F2} legacyThr={3:F2} (批次十一 - 保持高油门保姿态 authority)", vhNow, yG, vhKillFloor, legacyVhKillFloor));
+                                }
+                                // 批次十一: Trajectories prediction counter-effect
+                                // safety release. While the floor is commanding
+                                // non-trivial thrust (vhKillFloor > 0.3), watch the
+                                // Trajectories-predicted impact-point horizontal
+                                // distance to the pad (target-centred frame, same
+                                // transform as the Actual.dat traj_x/traj_z log).
+                                // If that distance is strictly growing across a
+                                // 5-sample rolling window (≈0.5 s at 10 Hz), the
+                                // brake is doing net counter-work - attitude
+                                // misalignment, aero drift and thrust
+                                // misdirection all fold into this one physical
+                                // number. Release the floor unconditionally and
+                                // let the glide take over. Sign-of-derivative
+                                // only, no fitted magnitude threshold (the 5 m
+                                // band just rejects prediction jitter). One-shot
+                                // per LB pass (f220 anti-ping-pong).
+                                if ((!simulate) && (!trajCounterEffectTriggered) && (vhKillFloor > 0.3) && (logTransform != null))
+                                {
+                                    Vector3d? impCE = TrajAPI.GetImpactPosition();
+                                    if (impCE.HasValue)
+                                    {
+                                        Vector3d tImpCE = logTransform.InverseTransformPoint(impCE.Value + body.position);
+                                        double dPred = Math.Sqrt(tImpCE.x * tImpCE.x + tImpCE.z * tImpCE.z);
+                                        trajPredDistWindow[trajPredDistWindowIdx] = dPred;
+                                        trajPredDistWindowIdx = (trajPredDistWindowIdx + 1) % trajPredDistWindow.Length;
+                                        if (trajPredDistWindowCount < trajPredDistWindow.Length)
+                                            trajPredDistWindowCount++;
+                                        if (trajPredDistWindowCount >= trajPredDistWindow.Length)
+                                        {
+                                            // after write+advance: window[idx] is
+                                            // the oldest sample (next write slot),
+                                            // window[(idx-1+N)%N] is the newest
+                                            double oldestPred = trajPredDistWindow[trajPredDistWindowIdx];
+                                            double newestPred = trajPredDistWindow[(trajPredDistWindowIdx + trajPredDistWindow.Length - 1) % trajPredDistWindow.Length];
+                                            if (newestPred > oldestPred + 5.0)
+                                            {
+                                                trajCounterEffectTriggered = true;
+                                                if (t - trajCounterEffectLogT > 5)
+                                                {
+                                                    trajCounterEffectLogT = t;
+                                                    Log.Info(string.Format("[LandingBurn] vh-kill COUNTER-EFFECT release: vh={0:F1} y={1:F0} d_pred={2:F0} d_oldest={3:F0} d_newest={4:F0} thr={5:F2} attErr={6:F1} (批次十一 - 预测落点远离, 地板做反功, 立刻释放交棒滑翔)", vhNow, yG, dPred, oldestPred, newestPred, vhKillFloor, attErrPrevTick));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 // flight-logging-v2 (D1): brake-budget triple
                                 // readout - stash where the locals live; the
                                 // row writer NaNs them when the floor is off
