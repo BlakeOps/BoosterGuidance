@@ -33,10 +33,11 @@ class TerminalReplay
 
     static Vector3d CallV2G(object ctl, MethodInfo mi, Vector3d posErr, Vector3d vel, Vector3d up, double y, double vy, double maxAoA)
     {
-        // REVERT f216: back on the f196 (BC4B1E51) build - VelocityToGoCorrection
-        // is the plain 7-param law (posErr, vel_air, up, y, vy, maxAoA, omegaLat);
-        // the f212-f215 optional params (mark-hold/t/ownMarkErr/closingCap) are gone
-        return (Vector3d)mi.Invoke(ctl, new object[] { posErr, vel, up, y, vy, maxAoA, new Vector3d(0, 0, 0) });
+        // 批次三 方案U (ba99f8e) added the 8th param amax (terminal give-up
+        // feasibility: vDes=0 when posErr > min(amax*sin(maxAoA),3)*tGo^2/2).
+        // amax=35 saturates the aLatTerm cap at 3 for maxAoA=12 (any flown
+        // TWR does), so the replication below uses the constant 3.
+        return (Vector3d)mi.Invoke(ctl, new object[] { posErr, vel, up, y, vy, maxAoA, new Vector3d(0, 0, 0), 35.0 });
     }
 
     static int Main(string[] args)
@@ -180,6 +181,7 @@ class TerminalReplay
                 double vCap = Math.Max(2, (posErr.magnitude - brakeR) / tGo + 2);
                 bool capBites = vDesExp.magnitude > vCap;
                 if (capBites) { capBiteRows++; vDesExp = Vector3d.Normalize(vDesExp) * vCap; }
+                if ((y < 300) && (y > 0) && (posErr.magnitude > 3 * tGo * tGo / 2)) vDesExp = Vector3d.zero; // 批次三 方案U give-up (aLatTerm = min(35*sin(12deg),3) = 3)
                 if (posErr.magnitude > 25 * tGo) vDesExp = Vector3d.zero; // f113 falcon uncoverable
                 if (vDesExp.magnitude > 25) vDesExp = Vector3d.Normalize(vDesExp) * 25;
                 Vector3d corrExp = (vDesExp - vh) * (Math.PI / 180.0); // v2gKp=1, steerDamping=0
