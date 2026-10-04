@@ -946,23 +946,26 @@ namespace BoosterGuidance
         }
         // 批次十三 方案3: AeroDescent brake-regime channel reader. Returns the
         // AD-specific EMA value once it has a minimum number of samples
-        // (calBinMinSamples reused for consistency), otherwise the glide
-        // global as a fallback.
+        // (calBinMinSamples reused for consistency). Fallback is 1.0 (no
+        // correction), NOT the glide global - the global was measured in the
+        // belly/glide regime (~18-85 deg) and would be a regime mismatch on the
+        // retrograde-ish AD brake the sim actually flies.
         public double EffectiveCalLiftAd()
         {
             if (aeroCalSamplesAd >= calBinMinSamples)
                 return aeroCalLiftAd;
-            return aeroCalLift;
+            return 1;
         }
         public double EffectiveCalDragAd()
         {
             if (aeroCalSamplesAd >= calBinMinSamples)
                 return aeroCalDragAd;
-            return aeroCalDrag;
+            return 1;
         }
         private Vector3d calPrevV = Vector3d.zero;
         private double calPrevT = -1;
         private double calLastLogT = -100;
+        private double calAdLastLogT = -100; // 批次十四: AD channel's own log clock (never share - a shared timer silences one of the two channels)
         public int calSamples = 0; // public: the core rate-limits PluginData saves on its growth (f63 revert-proof persistence)
         private double prevThrottleOut = 0;
         // Belly-tracking error captured at the pre-log assignment (live only).
@@ -2564,6 +2567,67 @@ namespace BoosterGuidance
                         aeroCalSamplesQ[0], aeroCalSamplesQ[1], aeroCalSamplesQ[2],
                         aeroCalLiftAbQ[0], aeroCalLiftAbQ[1], aeroCalLiftAbQ[2],
                         aeroCalSamplesAbQ[0], aeroCalSamplesAbQ[1], aeroCalSamplesAbQ[2]));
+                }
+                // 批次十四 方案3: AeroDescent brake-regime calibration channel.
+                // The starship fast-approach flies ReentryBurn -> AeroDescent ->
+                // LandingBurn and never enters BellyFlop, so the BF-gated
+                // calibration above never samples for it. The sim flies AD
+                // retrograde (aoa=PI, Simulate.cs) but with an UNCORRECTED cache
+                // drag - the user's diagnosis is that this cache drag reads low,
+                // so the predicted approach speed reads high and the landing
+                // burn over-fuels. Measure the realized-vs-model ratio here.
+                // IMPORTANT: evaluate the model at the TRUE flown AoA (att vs
+                // velocity), not the belly schedule - the AD attitude runs
+                // near-broadside high up and rotates toward retrograde as it
+                // descends into the high-q brake (flight data: tilt ~80deg early
+                // -> ~10deg late). Engine-off + on-attitude gates mirror BF.
+                if ((aeroLiveCal) && (phase == BLControllerPhase.AeroDescent) && (!PassiveGlide())
+                    && (calDt > 0.005) && (calDt < 0.2) && (prevThrottleOut <= 0.001)
+                    && ((pilotThrottle <= 0.01f) || (!pilotBurnAttitude))
+                    && (bellyAttErrLive < 10) && (vel_air.magnitude > 50))
+                {
+                    double qAd = DynamicPressure(y, vel_air.magnitude, body);
+                    if (qAd > 200)
+                    {
+                        Vector3d velNad = Vector3d.Normalize(vel_air);
+                        // GetForces AoA convention: 0 = prograde (nose along
+                        // velocity), PI = retrograde (nose opposite velocity).
+                        double aoaAd = Math.Acos(HGUtils.Clamp(Vector3d.Dot(att, velNad), -1, 1));
+                        Vector3d aeroRealAd = (v - calPrevV) / calDt - r * (-body.gravParameter / (r.magnitude * r.magnitude * r.magnitude));
+                        Vector3d dragAxisAd = -velNad;
+                        Vector3d liftPerpAd = Vector3d.Exclude(vel_air, up);
+                        if (liftPerpAd.magnitude > 0.01)
+                        {
+                            Vector3d liftAxisAd = Vector3d.Normalize(liftPerpAd);
+                            double calRateAd = ((rbAdEntryT >= 0) && (t - rbAdEntryT < aeroCalFastWindowSec)) ? aeroCalRateFast : aeroCalRate;
+                            Vector3d modelAccAd = aeroModel.GetForces(body, r, vel_air, aoaAd) / totalMass;
+                            double dMAd = Vector3d.Dot(modelAccAd, dragAxisAd);
+                            double lMAd = Vector3d.Dot(modelAccAd, liftAxisAd);
+                            double dRAd = Vector3d.Dot(aeroRealAd, dragAxisAd);
+                            double lRAd = Vector3d.Dot(aeroRealAd, liftAxisAd);
+                            bool sampledAd = false;
+                            if ((dMAd > 0.2) && (dRAd > 0))
+                            {
+                                double kdAd = HGUtils.Clamp(dRAd / dMAd, 0.3, 3);
+                                aeroCalDragAd += calRateAd * (kdAd - aeroCalDragAd);
+                                sampledAd = true;
+                            }
+                            if ((lMAd > 0.2) && (lRAd > 0))
+                            {
+                                double klAd = HGUtils.Clamp(lRAd / lMAd, 0.3, 3);
+                                aeroCalLiftAd += calRateAd * (klAd - aeroCalLiftAd);
+                                sampledAd = true;
+                            }
+                            if (sampledAd)
+                                aeroCalSamplesAd++;
+                            if (t - calAdLastLogT >= 15)
+                            {
+                                calAdLastLogT = t;
+                                Log.Info(string.Format("[AeroCalAD] t={0:F0} alt={1:F0} q={2:F0} aoaTrue={3:F0} bErr={4:F1} dt={5:F3} kLad={6:F2} kDad={7:F2} nAd={8}",
+                                    t, y, qAd, aoaAd / deg2rad, bellyAttErrLive, calDt, aeroCalLiftAd, aeroCalDragAd, aeroCalSamplesAd));
+                            }
+                        }
+                    }
                 }
                 calPrevV = v;
                 calPrevT = t;

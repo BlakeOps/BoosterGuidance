@@ -141,6 +141,32 @@ namespace BoosterGuidance
                     }
                 }
             }
+            // 批次十四 方案3: the starship fast-approach flies AeroDescent
+            // (never BellyFlop), so the BF-gated correction above never applies
+            // and the AD retrograde brake (aoa=PI above) runs on the raw cache.
+            // Apply the AD channel (measured in BLController at the true flown
+            // AoA) to the retrograde drag/lift so the predicted approach speed
+            // matches the realized decel. Falls back to 1.0 until the channel
+            // has calBinMinSamples samples, so a cold flight is unchanged.
+            if ((controller != null) && (controller.recoveryProfile == "starship")
+                && (controller.phase == BLControllerPhase.AeroDescent) && (controller.aeroLiveCal)
+                && (vel_air.magnitude > 1))
+            {
+                double kdAd = controller.EffectiveCalDragAd();
+                double klAd = controller.EffectiveCalLiftAd();
+                if ((kdAd != 1) || (klAd != 1))
+                {
+                    Vector3d dragAxisAd = -Vector3d.Normalize(vel_air);
+                    Vector3d liftPerpAd = Vector3d.Exclude(Vector3d.Normalize(r), vel_air);
+                    if (liftPerpAd.magnitude > 0.01)
+                    {
+                        Vector3d liftAxisAd = Vector3d.Normalize(liftPerpAd);
+                        double fdAd = Vector3d.Dot(Fa, dragAxisAd);
+                        double flAd = Vector3d.Dot(Fa, liftAxisAd);
+                        Fa = dragAxisAd * (fdAd * kdAd) + liftAxisAd * (flAd * klAd) + (Fa - dragAxisAd * fdAd - liftAxisAd * flAd);
+                    }
+                }
+            }
             Vector3d F = Fa * aeroFudgeFactor + Ft;
             Vector3d a = F / totalMass + g;
 
