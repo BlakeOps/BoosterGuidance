@@ -1049,6 +1049,8 @@ namespace BoosterGuidance
         private double aeroCmdAng = 0;          // slew-limited aero command angle (deg)
         private double aPerDegWSm = -1;         // f229 方案四: smoothed measured aero gain (m/s^2/deg, -1 = unseeded)
         private double aPerDegASm = -1;         // f238 方案: AeroDescent adaptive cap's smoothed measured aero gain (m/s^2/deg, -1 = unseeded)
+        private double dragBrakeDeg = 0;        // 批次十七: slew-limited AD drag-brake departure off the learned trim (deg, 0 = pure trim); reset on leaving AeroDescent
+        private double lastDragBrakeLogT = -100; // 批次十七 log cadence
         // f243 方案一: the AeroDescent demand consumes a CLEANED signal. The raw
         // 1 Hz own-sim prediction jumps +-50-100 m between runs (PlanJump); the
         // additive law saturates the corr cap for any |err| > ~10 m, so near
@@ -2409,7 +2411,10 @@ namespace BoosterGuidance
             // dense high-q brake regime right after RB); reset when leaving
             // AeroDescent so a later entry earns its own window
             if (phase != BLControllerPhase.AeroDescent)
+            {
                 rbAdEntryT = -1;
+                dragBrakeDeg = 0;   // 批次十七: the brake departure dies with the glide - the burn needs the retrograde trim
+            }
 
             System.Diagnostics.Stopwatch timer = new System.Diagnostics.Stopwatch();
             timer.Start();
@@ -4387,6 +4392,65 @@ namespace BoosterGuidance
                     if (!aeroTrimValid) { aeroTrimAtt = -Vector3d.Normalize(vel_air); aeroTrimValid = true; }
                     else if (demMag <= 0)
                         aeroTrimAtt = Vector3d.Normalize(aeroTrimAtt + (att - aeroTrimAtt) * HGUtils.Clamp(dtLA / 15.0, 0, 1));
+                    // 批次十七 (user-approved 2026-10-05): AD drag-brake
+                    // channel. Purpose is CALIBRATION - pull the predicted
+                    // impact point back onto the target when it runs LONG
+                    // along the travel direction; the deceleration is a side
+                    // effect, not the goal (user: 主要是校准功能不是减速).
+                    // One-way door: brake only - a SHORT mark is the landing
+                    // burn's reach problem, and de-streamlining below the
+                    // natural trim fights the weathervane for nothing.
+                    // Demand prices the kinematic identity shift=a*tGo^2/2;
+                    // delivery is SECANT-SOLVED on the aero model at the real
+                    // working point (AdCancelDeparture, the 批次五 solver).
+                    // The departure is hard-capped by the slew budget out of
+                    // the REAL ignition clock (time to landingBurnHeight):
+                    // whatever angle we add must come back off at 5 deg/s
+                    // before the burn needs its retrograde attitude
+                    // (apply-half / remove-half split), and by broadside
+                    // (90deg off retrograde = max drag, past it drag FALLS).
+                    Vector3d aeroTrimAttEff = aeroTrimAtt;
+                    double aDragNeedA = 0;
+                    double dragCapA = 0;
+                    {
+                        Vector3d vhVecA = Vector3d.Exclude(up, vel_air);
+                        double vhMagA = vhVecA.magnitude;
+                        double eAlongA = (vhMagA > 10) ? Vector3d.Dot(aeroErrSm, vhVecA / vhMagA) : 0;
+                        double tToIgniteA = (yG - landingBurnHeight) / Math.Max(50, -vy);
+                        dragCapA = Math.Min(90 - tiltNowDeg, Math.Max(0, 2.5 * tToIgniteA));
+                        double dragPhiCmd = 0;
+                        if ((eAlongA > aeroDeadband) && (dragCapA > 0.5))
+                        {
+                            aDragNeedA = 2.0 * (eAlongA - aeroDeadband) / Math.Max(1, tGoA * tGoA);
+                            Vector3d velNdrag = Vector3d.Normalize(vel_air);
+                            Vector3d FtrimD = aeroModel.GetForces(vessel.mainBody, r, vel_air, (180 - tiltNowDeg) * deg2rad);
+                            Func<double, double> dragDeliveredAt = (double A) =>
+                            {
+                                Vector3d FA = aeroModel.GetForces(vessel.mainBody, r, vel_air, (180 - tiltNowDeg - A) * deg2rad);
+                                return Vector3d.Dot(FtrimD - FA, velNdrag) * aeroMult / Math.Max(1, totalMass); // + = added drag
+                            };
+                            dragPhiCmd = AdCancelDeparture(aDragNeedA, dragDeliveredAt, dragCapA);
+                        }
+                        // 5 deg/s slew (the LB glide's rate) - the brake eases
+                        // in/out instead of banging against the trim
+                        dragBrakeDeg += HGUtils.Clamp(dragPhiCmd - dragBrakeDeg, -5 * dtLA, 5 * dtLA);
+                        if (dragBrakeDeg > 0.05)
+                        {
+                            Vector3d velNdir = -Vector3d.Normalize(vel_air);
+                            Vector3d offA = aeroTrimAtt - velNdir * Vector3d.Dot(aeroTrimAtt, velNdir);
+                            if (offA.magnitude > 1e-3)
+                            {
+                                double phiA = Math.Acos(HGUtils.Clamp(Vector3d.Dot(aeroTrimAtt, velNdir), -1, 1));
+                                double phiNewA = Math.Min(phiA + dragBrakeDeg * deg2rad, Math.PI / 2);
+                                aeroTrimAttEff = velNdir * Math.Cos(phiNewA) + Vector3d.Normalize(offA) * Math.Sin(phiNewA);
+                            }
+                            if (t - lastDragBrakeLogT > 5)
+                            {
+                                lastDragBrakeLogT = t;
+                                Log.Info(string.Format("[AeroDescent] DRAG-BRAKE: t={0:F1} y={1:F0} eAlong={2:F0} aNeed={3:F2} dPhi={4:F1}/{5:F1} tilt={6:F1} tIg={7:F0}s (批次十七 校准通道 - 拉回超前落点)", t, yG, eAlongA, aDragNeedA, dragBrakeDeg, dragCapA, tiltNowDeg, tToIgniteA));
+                            }
+                        }
+                    }
                     // 批次五 (ad-lowalt-active-correction, user-approved
                     // 2026-10-02): low-altitude ACTIVE cancellation. D2 gate:
                     // demand + measured honesty (3x/2x noise hysteresis) +
@@ -4439,8 +4503,8 @@ namespace BoosterGuidance
                             Log.Info(string.Format("[AeroDescent] AD-CANCEL: t={0:F1} y={1:F0} errSm={2:F0} noise={3:F0} db={4:F0} aPerDeg={5:F4} aReq={6:F2} handover={7} cap={8:F1} ang={9:F1} active={10}", t, yG, errSmMag, predNoiseSm, aeroDeadband, aPerDegASm, aReq, handoverFits ? "fits" : "COLLAPSE", angCapA, ang, adCancelActive ? 1 : 0));
                         }
                     }
-                    steer = aeroTrimAtt + GetSteerCorrection(aeroErrSm, ang, angCapA, omegaLat);
-                    TagOwnerSteer(adCancelActive ? "AD-cancel" : "AD-glide");
+                    steer = aeroTrimAttEff + GetSteerCorrection(aeroErrSm, ang, angCapA, omegaLat);
+                    TagOwnerSteer(adCancelActive ? "AD-cancel" : ((dragBrakeDeg > 0.05) ? "AD-glide+dragbrake" : "AD-glide"));
                 }
 
                 double landingMinThrust, landingMaxThrust;
