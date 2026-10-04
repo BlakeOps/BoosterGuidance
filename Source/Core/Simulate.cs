@@ -102,7 +102,7 @@ namespace BoosterGuidance
                 // self-correcting side of the asymmetry
                 aoa = ((controller.glideLost) || (controller.bellyBraking))
                     ? Math.PI
-                    : controller.BellyAoADeg(qSim, Vector3d.Exclude(Vector3d.Normalize(r), vel_air).magnitude) * Math.PI / 180.0;
+                    : controller.BellyAoADegCapped(qSim, Vector3d.Exclude(Vector3d.Normalize(r), vel_air).magnitude, -1, totalMass, vel_air, r, body) * Math.PI / 180.0; // 批次十二: 与 live 一致走阻力减速 cap
             }
             Vector3d Fa = aeroModel.GetForces(body, r, vel_air, aoa);
             // Live-calibrated aero scaling (flight 59): the cache's 18-deg

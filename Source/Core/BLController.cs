@@ -272,6 +272,8 @@ namespace BoosterGuidance
         private double bellyAoASlew = 90;
         private double bellyAoASlewT = -1;
         private const double bellyAoACmdSlewRate = 10; // deg/s
+        // 批次十二: drag-decel-cap 诊断日志节流
+        private double lastDragCapLogT = -100;
         // f114: lateral ROLL-pulse command (deg, added on top of the GUI-
         // calibrated bellyRollOffset by BoosterGuidanceCore when calling
         // starshipAtt.Update). Zero outside the pulse. Replaces the f106
@@ -2110,6 +2112,56 @@ namespace BoosterGuidance
             return aoa;
         }
 
+        // 批次十二 (user-approved 2026-10-04): 阻力减速上限。
+        // 输入: 调度角度 + 当前状态 (质量/速度/位置)。
+        // 输出: 可能降低后的角度, 使得空气阻力造成的减速度不超过
+        //       当地重力加速度 g。
+        // 物理阈值: g (不是拟合数)。轻船自动降角, 重船不受影响。
+        // 原理: aDrag = F_drag(q, α) / m。同一角度, 轻船 (m 小)
+        //       的 aDrag 大, 会被空气 "接管" 然后姿态震荡。cap 到
+        //       g 后, 轻船自然降角, 重船不变。
+        private double ApplyDragDecelCap(double aoaScheduled, double totalMass, Vector3d vel_air, Vector3d r, CelestialBody body)
+        {
+            // 低速/零质量/极小角度下 cap 无意义, 直接返回
+            if ((totalMass <= 0) || (vel_air.magnitude < 20) || (aoaScheduled <= 1))
+                return aoaScheduled;
+
+            Vector3d velN = Vector3d.Normalize(vel_air);
+            Vector3d dragAxis = -velN;
+            double gHere = body.gravParameter / (r.magnitude * r.magnitude);
+
+            // 当前调度角度的阻力减速 (用实测比率 aeroCalDrag 修正模型)
+            Vector3d forceNow = aeroModel.GetForces(body, r, vel_air, aoaScheduled * deg2rad);
+            double aDragNow = -Vector3d.Dot(forceNow, dragAxis) / totalMass * aeroCalDrag;
+
+            if (aDragNow <= gHere)
+                return aoaScheduled; // cap 不生效
+
+            // 二分反解 α_cap 使得 aDrag(α_cap) = gHere
+            // C_D(α) 在 [0°, 90°] 单调递增 (平板特性), 所以 aDrag 也单调, 二分稳定
+            // 15 次迭代 = 从 90° 压到 ~0.003° 精度, 远超需要
+            double loA = 0, hiA = aoaScheduled;
+            for (int i = 0; i < 15; i++)
+            {
+                double mid = (loA + hiA) * 0.5;
+                Vector3d fMid = aeroModel.GetForces(body, r, vel_air, mid * deg2rad);
+                double aMid = -Vector3d.Dot(fMid, dragAxis) / totalMass * aeroCalDrag;
+                if (Math.Abs(aMid - gHere) < 0.05) { hiA = mid; break; } // 0.05 m/s² 精度足够
+                if (aMid < gHere) loA = mid; else hiA = mid;
+            }
+            return hiA;
+        }
+
+        // 批次十二: 带阻力减速 cap 的 BellyAoADeg 包装。
+        // 所有 belly AoA 的调用点 (live / 校准 / 日志 / sim) 都走这个,
+        // 保证 ship / sim / 校准采样三方一致。
+        public double BellyAoADegCapped(double q, double vh, double pathDownDeg,
+                                        double totalMass, Vector3d vel_air, Vector3d r, CelestialBody body)
+        {
+            double aoaScheduled = BellyAoADeg(q, vh, pathDownDeg);
+            return ApplyDragDecelCap(aoaScheduled, totalMass, vel_air, r, body);
+        }
+
         // Path angle of the velocity vector below the horizon (deg, >= 0),
         // for the nose-above-horizon AoA floor above
         public static double PathDownDeg(Vector3d vel_air, Vector3d up)
@@ -2304,7 +2356,7 @@ namespace BoosterGuidance
                     && (bellyAttErrLive < 10) && (vel_air.magnitude > 50))
                 {
                     double qCal = DynamicPressure(y, vel_air.magnitude, body);
-                    double aoaCal = BellyAoADeg(qCal, Vector3d.Exclude(up, vel_air).magnitude, PathDownDeg(vel_air, up));
+                    double aoaCal = BellyAoADegCapped(qCal, Vector3d.Exclude(up, vel_air).magnitude, PathDownDeg(vel_air, up), totalMass, vel_air, r, body); // 批次十二: 与飞行的 capped 角度一致
                     if ((qCal > 200) && (aoaCal <= 45))
                     {
                         Vector3d aeroReal = (v - calPrevV) / calDt - r * (-body.gravParameter / (r.magnitude * r.magnitude * r.magnitude));
@@ -2418,10 +2470,10 @@ namespace BoosterGuidance
                     calLastLogT = t;
                     if (CalBinsBad("log", -1))
                         Log.Info(string.Format("[AeroCal] t={0:F0} alt={1:F0} q={2:F0} aoa={3:F0} bErr={4:F1} dt={5:F3} thr={6:F3} kL={7:F2} kD={8:F2} n={9}",
-                            t, y, qLog, BellyAoADeg(qLog, Vector3d.Exclude(up, vel_air).magnitude, PathDownDeg(vel_air, up)), bellyAttErrLive, calDt, prevThrottleOut, aeroCalLift, aeroCalDrag, calSamples));
+                            t, y, qLog, BellyAoADegCapped(qLog, Vector3d.Exclude(up, vel_air).magnitude, PathDownDeg(vel_air, up), totalMass, vel_air, r, body), bellyAttErrLive, calDt, prevThrottleOut, aeroCalLift, aeroCalDrag, calSamples));
                     else
                     Log.Info(string.Format("[AeroCal] t={0:F0} alt={1:F0} q={2:F0} aoa={3:F0} bErr={4:F1} dt={5:F3} thr={6:F3} ab={7} kL={8:F2} kD={9:F2} n={10} kLq={11:F2}/{12:F2}/{13:F2} kDq={14:F2}/{15:F2}/{16:F2} nq={17}/{18}/{19} kLqab={20:F2}/{21:F2}/{22:F2} nqab={23}/{24}/{25}",
-                        t, y, qLog, BellyAoADeg(qLog, Vector3d.Exclude(up, vel_air).magnitude, PathDownDeg(vel_air, up)), bellyAttErrLive, calDt, prevThrottleOut, airbrakeOutPrev ? 1 : 0, aeroCalLift, aeroCalDrag, calSamples,
+                        t, y, qLog, BellyAoADegCapped(qLog, Vector3d.Exclude(up, vel_air).magnitude, PathDownDeg(vel_air, up), totalMass, vel_air, r, body), bellyAttErrLive, calDt, prevThrottleOut, airbrakeOutPrev ? 1 : 0, aeroCalLift, aeroCalDrag, calSamples,
                         aeroCalLiftQ[0], aeroCalLiftQ[1], aeroCalLiftQ[2], aeroCalDragQ[0], aeroCalDragQ[1], aeroCalDragQ[2],
                         aeroCalSamplesQ[0], aeroCalSamplesQ[1], aeroCalSamplesQ[2],
                         aeroCalLiftAbQ[0], aeroCalLiftAbQ[1], aeroCalLiftAbQ[2],
@@ -2789,7 +2841,7 @@ namespace BoosterGuidance
                 // the ship then crosses the interface already at the cruise
                 // AoA instead of snapping 30 deg when the air grabs it.
                 // Exo-atmospheric q is ~0 -> full brake end of the schedule
-                bellyAoACurrent = BellyAoADeg(DynamicPressure(y, vel_air.magnitude, body), Vector3d.Exclude(up, vel_air).magnitude);
+                bellyAoACurrent = BellyAoADegCapped(DynamicPressure(y, vel_air.magnitude, body), Vector3d.Exclude(up, vel_air).magnitude, -1, totalMass, vel_air, r, body); // 批次十二: 阻力减速 cap (exo 下 aDrag~0, 实际不生效)
                 bellyAoASlew = bellyAoACurrent; // f114: keep the slew-limited command state synced outside BellyFlop so the glide capture never steps
                 if ((r.magnitude - body.Radius < body.atmosphereDepth) && (vy < 0))
                 {
@@ -2815,7 +2867,21 @@ namespace BoosterGuidance
             // convention as AeroDescent) and the sim flies broadside (π/2)
             if (phase == BLControllerPhase.BellyFlop)
             {
-                bellyAoACurrent = BellyAoADeg(DynamicPressure(y, vel_air.magnitude, body), Vector3d.Exclude(up, vel_air).magnitude, PathDownDeg(vel_air, up));
+                bellyAoACurrent = BellyAoADegCapped(DynamicPressure(y, vel_air.magnitude, body), Vector3d.Exclude(up, vel_air).magnitude, PathDownDeg(vel_air, up), totalMass, vel_air, r, body); // 批次十二: 阻力减速 cap (aDrag ≤ g)
+                // 批次十二 诊断: cap 生效时 (capped < scheduled) 记录一次, 5s 节流
+                if ((!simulate) && (t - lastDragCapLogT > 5))
+                {
+                    double qDc = DynamicPressure(y, vel_air.magnitude, body);
+                    double aoaSched = BellyAoADeg(qDc, Vector3d.Exclude(up, vel_air).magnitude, PathDownDeg(vel_air, up));
+                    if (bellyAoACurrent < aoaSched - 0.5)
+                    {
+                        lastDragCapLogT = t;
+                        double gDc = body.gravParameter / (r.magnitude * r.magnitude);
+                        Vector3d fDc = aeroModel.GetForces(body, r, vel_air, aoaSched * deg2rad);
+                        double aDragSched = -Vector3d.Dot(fDc, -Vector3d.Normalize(vel_air)) / totalMass * aeroCalDrag;
+                        Log.Info(string.Format("[DragCap] t={0:F0} alt={1:F0} q={2:F0} m={3:F0} aDrag_sched={4:F1} g={5:F1} aoa_sched={6:F1} aoa_cap={7:F1} (批次十二 - 空气减速超重力, 降角)", t, y, qDc, totalMass, aDragSched, gDc, aoaSched, bellyAoACurrent));
+                    }
+                }
                 // Trim-flip detection (flight 51): belly attitude stuck >100
                 // deg off target for 5 s = the hull has flipped to its
                 // tail-first trim (flight 46) and the glide is lost. Stop
