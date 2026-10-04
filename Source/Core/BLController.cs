@@ -418,6 +418,15 @@ namespace BoosterGuidance
         // 0.6) - see the floor-block comment; kills the 5 Hz bang-bang that
         // halved lateral authority and put the 3.75m into the launch tower
         private const double vhKillDeadbandRelease = 0.6;
+        // 批次十六 (user-approved 2026-10-05): AD handovers at or below this
+        // horizontal speed fly the whole burn on the V2G velocity law alone -
+        // the vh-kill floor machinery (and the f89 vh floor) stays silent and
+        // the 批次三 item5 corr-floor (V2G demand anti-starve) extends from
+        // the terminal zone to the whole burn. Grounded in flight data, not
+        // fitted: the 2026-10-04 light-hull handovers (178t) sat at 107/143
+        // m/s and converged under V2G authority; the heavy handovers (1194t)
+        // start at 565 m/s = 3.8x margin above the cut. Starship only.
+        private const double vhKillV2gOnlyEntry = 150;
         // 批次十一 (user-approved 2026-10-04): sustained authority floor.
         // The exact-stop taper (aLatStop = vh²/(2·rem)) collapses thr to
         // ~0.01 by vh≈27, which on the 700 red-mark flight let attErr blow
@@ -1118,6 +1127,7 @@ namespace BoosterGuidance
         private double lastVhKillMeasT = -1;   // t of that sample
         private bool measWarmK = false;        // EMA has its first sample
         private double lastAppliedThrottleK = 0; // last tick's out (applied) throttle
+        private double lbEntryVh = -1;         // 批次十六: |vh| latched on the first LandingBurn tick (-1 = not in LB / not latched yet); the vhKillV2gOnly branch selector below reads it all burn
         private double lastTermVhFloorLogT = -100; // 批次六 V′-a floor log cadence
         private double lastV2gDbgT = -100;
         // f92 coast-translation floor: the suicide law manages VERTICAL speed
@@ -2393,6 +2403,7 @@ namespace BoosterGuidance
                 prevVhMagK = -1;
                 measWarmK = false;
                 lastVhKillMeasT = -1; // 批次六 ③: the sample clock resets too - a stale clock spanned the non-LB gap into the dtK<5 guard (f274)
+                lbEntryVh = -1;       // 批次十六: the entry-speed latch re-arms for the next burn
             }
             // 批次十三 方案3: the fast-convergence window is AD-only (the
             // dense high-q brake regime right after RB); reset when leaving
@@ -4485,6 +4496,15 @@ namespace BoosterGuidance
                 // once-per-enable SetActiveEngines here PLUS the per-tick
                 // core loop, so engines the user adds mid-burn stay lit
                 av = Math.Max(0.1, amax - g); // wrong on first iteration
+                // 批次十六: latch the AD handover speed on the first burn
+                // tick - the vhKillV2gOnly branch selector below reads this
+                // all burn (reset on leaving LB, top of method)
+                if (lbEntryVh < 0)
+                {
+                    lbEntryVh = Vector3d.Exclude(up, vel_air).magnitude;
+                    if (!simulate)
+                        Log.Info(string.Format("[LandingBurn] 批次十六 entry: vh={0:F0} -> {1} (cut {2:F0})", lbEntryVh, ((recoveryProfile == "starship") && (lbEntryVh <= vhKillV2gOnlyEntry)) ? "V2G-only" : "vh-kill required-velocity", vhKillV2gOnlyEntry));
+                }
                 // f196: the manual record hand-over is live above the
                 // upright zone only - below it the law goes upright-only
                 // anyway, so the program owns the attitude again (auto
@@ -4551,6 +4571,13 @@ namespace BoosterGuidance
                         // so the gate is always open there and the prediction
                         // still sees the same law
                         bool floorsAttOk = (recoveryProfile == "starship") || (attErrPrevTick <= 25);
+                        // 批次十六 (user-approved 2026-10-05): a slow AD
+                        // handover (<= vhKillV2gOnlyEntry, latched at entry)
+                        // flies the whole burn on the V2G velocity law alone
+                        // - the vh-kill floor and the f89 floor stay silent,
+                        // the corr-floor below extends to all altitudes.
+                        // Starship only; falcon paths unchanged.
+                        bool vhKillV2gOnly = (recoveryProfile == "starship") && (lbEntryVh >= 0) && (lbEntryVh <= vhKillV2gOnlyEntry);
                         // f89: the suicide law manages VERTICAL speed only.
                         // Entering the burn slower than the profile (early
                         // flip after a violent brake, or a genuine horizontal
@@ -4599,7 +4626,7 @@ namespace BoosterGuidance
                         Vector3d tgtF89 = Vector3d.Exclude(up, tgt_r - r);
                         double remF89 = (vhMagF > 1) ? Vector3d.Dot(tgtF89, Vector3d.Exclude(up, vel_air) / vhMagF) : tgtF89.magnitude;
                         double vNeedF89 = remF89 / Math.Max((yG - aoaRampLowAlt) / Math.Max(50, -vy), vhKillTBandMin);
-                        if ((!simulate) && floorsAttOk && (yG > 300) && (vhMagF > Math.Max(f89VhOn, vNeedF89)) && (throttle < f89Floor))
+                        if ((!simulate) && floorsAttOk && (!vhKillV2gOnly) && (yG > 300) && (vhMagF > Math.Max(f89VhOn, vNeedF89)) && (throttle < f89Floor))
                         {
                             throttle = f89Floor;
                             if (t - lastVhFloorLogT > 5)
@@ -4795,8 +4822,48 @@ namespace BoosterGuidance
                         // longer fit, which is exactly when the dive leaves
                         // no room to use it). remHK>0 here by the gate above;
                         // rem<=0 is overwritten by the overshoot branch below
-                        double aLatStop = vhNow * vhNow / (2 * Math.Max(remHK, 25));
-                                double aLatReq = aLatStop;
+                        double aLatStop = vhNow * vhNow / (2 * Math.Max(remHK, 25)); // 批次十六: LOG-ONLY from here on (was the closing demand - kept for the floor logs)
+                                // 批次十六 应需速度律 (user-approved 2026-10-05):
+                                // the kill is priced off the REQUIRED-VELOCITY
+                                // PROFILE in the 2D horizontal plane, replacing
+                                // the along-velocity projection (remHK) demand.
+                                // vReq = sqrt(2*aAuth*dist) pointed AT the pad is
+                                // the speed from which a full-authority stop
+                                // lands exactly on target - tracking it makes
+                                // position and velocity reach zero TOGETHER, so
+                                // the correction always completes while tilt
+                                // authority still exists (the "flew past the pad
+                                // near-vertical, cannot pull back" lesson: the
+                                // law must never need a late low-altitude pull).
+                                // aAuth prices the plan off the MEASURED delivery
+                                // once warm (交接同源: the same number the ratio
+                                // closure prices against), the tilt-only model
+                                // before - the profile self-tightens as the real
+                                // authority fades with altitude/attitude.
+                                // Demand = |excess along the profile + cross
+                                // misalignment| / tau, capped at aAuth = the law
+                                // can never command what cannot be delivered.
+                                // SLOWER than the profile for a genuine gap ->
+                                // SILENT: keeping speed toward a far target is
+                                // always cheaper than re-buying it under thrust
+                                // (f170, unchanged). Overshoot (remHK<=0) is
+                                // still owned by the slam/glide machinery below.
+                                double aAuthK = (measWarmK && (aMeasHKill > 1)) ? aMeasHKill : aLatFull;
+                                double tauK = HGUtils.Clamp(tBand / 3, 2, 6);
+                                double vReqMagK = 0;
+                                double aLatReq;
+                                if (distHK <= 1)
+                                    aLatReq = vhNow / tauK;   // on the pad: pure brake
+                                else
+                                {
+                                    Vector3d vReqHatK = tgtHK / distHK;
+                                    vReqMagK = Math.Sqrt(2 * aAuthK * distHK);
+                                    double vAlongK = Vector3d.Dot(vhVecK, vReqHatK);
+                                    double excessK = Math.Max(0, vAlongK - vReqMagK);
+                                    Vector3d vPerpK = vhVecK - vReqHatK * vAlongK;
+                                    aLatReq = Math.Sqrt(excessK * excessK + vPerpK.magnitude * vPerpK.magnitude) / tauK;
+                                }
+                                aLatReq = Math.Min(aLatReq, aAuthK);
                                 // f219 (user: 过冲就全力把水平速度立马减掉,
                                 // 不要再缓动油门了): rem<=0 (overflown) the
                                 // proportional stop trickle (vh^2/50 ~ 4
@@ -4882,6 +4949,12 @@ namespace BoosterGuidance
                                 bool slamCutHK = (vhNow < 5) || (vy >= -15) || ((!simulate) && (vhNow <= 40));
                                 if (overshotHK)
                                     aLatReq = (((!simulate) && overshootGlide) || slamCutHK) ? 0 : aLatFull;
+                                // 批次十六: slow-handing starship burn - the
+                                // V2G velocity law owns the horizontal channel
+                                // this burn, the kill floor stays silent (the
+                                // corr-floor below covers V2G anti-starve)
+                                if (vhKillV2gOnly)
+                                    aLatReq = 0;
                                 // f131 (user: 精度好但有点废燃料 - picked 方案A
                                 // 死区): small demands (0.1-2.5) are residuals the
                                 // terminal v2g absorbs free under the final burn's
@@ -5042,9 +5115,9 @@ namespace BoosterGuidance
                                         if (overshotHK)
                                             Log.Info(string.Format("[LandingBurn] vh-kill SLAM: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} -> thr={5:F2} (overshoot FULL brake, f219 - 过冲全力杀, no more gentle pacing)", vhNow, vy, yG, distHK, remHK, throttle));
                                         else if (ratioPriced)
-                                            Log.Info(string.Format("[LandingBurn] vh-kill floor: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} res={5:F0} tBand={6:F1}s aStop={7:F1} aLatReq={8:F1} aMeas={9:F1} thrPrev={10:F2} -> thr={11:F2} (方案X′ measured-delivery ratio closure)", vhNow, vy, yG, distHK, remHK, vhRes, tBand, aLatStop, aLatReq, aMeasHKill, lastAppliedThrottleK, throttle));
+                                            Log.Info(string.Format("[LandingBurn] vh-kill floor: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} res={5:F0} tBand={6:F1}s aStop={7:F1} aLatReq={8:F1} aMeas={9:F1} thrPrev={10:F2} -> thr={11:F2} vReq={12:F0} aAuth={13:F1} (方案X′ ratio closure on 批次十六 required-velocity demand)", vhNow, vy, yG, distHK, remHK, vhRes, tBand, aLatStop, aLatReq, aMeasHKill, lastAppliedThrottleK, throttle, vReqMagK, aAuthK));
                                         else
-                                            Log.Info(string.Format("[LandingBurn] vh-kill floor: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} res={5:F0} tBand={6:F1}s aStop={7:F1} aLatReq={8:F1}/{9:F1} -> thr={10:F2} (exact-stop horizontal kill, 方案R R1 restored - always rides the stop curve; f170 vNeed={12:F0} log-only, res log-only)", vhNow, vy, yG, distHK, remHK, vhRes, tBand, aLatStop, aLatReq, aLatFull, throttle, aoaRampLowAlt, vNeedHK));
+                                            Log.Info(string.Format("[LandingBurn] vh-kill floor: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} res={5:F0} tBand={6:F1}s aStop={7:F1} aLatReq={8:F1}/{9:F1} -> thr={10:F2} vReq={12:F0} aAuth={13:F1} (批次十六 应需速度律; f170 vNeed={11:F0} log-only, aStop log-only)", vhNow, vy, yG, distHK, remHK, vhRes, tBand, aLatStop, aLatReq, aLatFull, throttle, vNeedHK, vReqMagK, aAuthK));
                                     }
                                 }
                                 }
@@ -5065,7 +5138,11 @@ namespace BoosterGuidance
                             // f131/f132 1.5 m/s2 split, no new constants.
                             // Sim gets the same floor = sim flies what the
                             // ship flies.
-                            if ((yG < V2gTermHeightEff) && (v2gDmdALat >= vhKillDeadband))
+                            // 批次十六: in the V2G-only branch (slow starship
+                            // handover) this anti-starve floor covers the WHOLE
+                            // burn, not just the terminal zone - it is the only
+                            // throttle backer the V2G correction has there
+                            if (((yG < V2gTermHeightEff) || vhKillV2gOnly) && (v2gDmdALat >= vhKillDeadband))
                             {
                                 double corrFloor = Math.Min(v2gDmdALat / Math.Max(0.1, aLatFull), 0.85 * g / Math.Max(1, amax));
                                 if (throttle < corrFloor)
