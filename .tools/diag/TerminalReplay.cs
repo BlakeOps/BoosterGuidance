@@ -46,6 +46,16 @@ class TerminalReplay
         string bgDir = args.Length > 1 ? args[1] : @"E:\ksp_mod\BoosterGuidance\Source\bin\Release";
         string managed = args.Length > 2 ? args[2] : @"D:\GamePlatform\Steam\steamapps\common\Kerbal Space Program\KSP_x64_Data\Managed";
 
+        // The fixture lives in .claude/ (gitignored, local-only). A missing
+        // file must be a legible gate FAIL, not an unhandled exception that
+        // kills the process with no message (File.ReadLines throws on first
+        // enumeration, OUTSIDE the try below).
+        if (!File.Exists(logPath))
+        {
+            Console.WriteLine("FAIL: log file not found: " + logPath);
+            return 1;
+        }
+
         // Parse terminal LandingBurn rows (y < 120m) - no KSP types here, so
         // this stays in Main above the resolver registration boundary
         var rows = new List<double[]>();

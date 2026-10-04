@@ -36,6 +36,16 @@ class ThrottleReplay
         string bgDir = args.Length > 1 ? args[1] : @"E:\ksp_mod\BoosterGuidance\Source\bin\Release";
         string managed = args.Length > 2 ? args[2] : @"D:\GamePlatform\Steam\steamapps\common\Kerbal Space Program\KSP_x64_Data\Managed";
 
+        // The fixture lives in .claude/ (gitignored, local-only). A missing
+        // file must be a legible gate FAIL, not an unhandled exception that
+        // kills the process with no message (File.ReadLines throws on first
+        // enumeration, OUTSIDE the try below).
+        if (!File.Exists(logPath))
+        {
+            Console.WriteLine("FAIL: log file not found: " + logPath);
+            return 1;
+        }
+
         var rows = new List<double[]>();
         foreach (string line in File.ReadLines(logPath))
         {
