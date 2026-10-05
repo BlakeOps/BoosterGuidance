@@ -440,6 +440,15 @@ namespace BoosterGuidance
         // transition between "slam can still kill" and "glide must walk it
         // back") — not a new fitted number.
         private const double vhKillReleaseVh = 12;
+        // 批次十九 (方向4 user-approved 2026-10-05; 数值为分析结论, 非用户
+        // 原话): beyond this horizontal distance the engine-off glide has
+        // never walked a hole back - every PROVEN glide walk-back sat inside
+        // 300 m (f222 15, f224 44, f228 161->12), while the >=330 m cases
+        // (f218/f220 66->330 topple, f035608 4317 -> 3410 miss) were all
+        // failures of that channel. Farther out the burn owns the return
+        // (farReturn below): the glide zone may not claim the ship there,
+        // and a glide that walks OUT past the line hands it back.
+        private const double overshootGlideMaxDist = 300;
         // 批次十三 方案2 (分析结论, 非用户原话): the f236/f237 lateral-accel
         // cap was tuned at the 700 red-mark ship's mass (~700 t). Its 3 m/s^2
         // equals ~7.5% of that ship's thrust authority. A lighter ship at the
@@ -1015,6 +1024,15 @@ namespace BoosterGuidance
         // machine is real-flight only) - the sim path keeps the f219
         // slam law unchanged
         private bool overshootGlide = false;
+        // 批次十九 (方向4 别杀绝): far-return owns this tick - the ship sits
+        // beyond the glide envelope with less than the return-profile speed
+        // (stopped or receding included), so the vh-kill demand tracks
+        // vRet = sqrt(2*aLatFull*dist) pointed AT the pad and the steer is
+        // up+corr (the retro-lean base would brake the very toward-pad
+        // motion the floor is buying). Real flight + falcon + falling only;
+        // recomputed every LandingBurn tick in the demand block, consumed
+        // by the steer compose below. Never set in sim (replay gates).
+        private bool farReturnLB = false;
         // 批次十一 (lb-brake-early-high-throttle, user-approved 2026-10-04):
         // sustained authority floor — keep throttle >= 0.5 while vh > 12,
         // so attitude authority is preserved through the taper window.
@@ -2660,6 +2678,7 @@ namespace BoosterGuidance
                 burnLatMode = 0;
                 latModeSince = -1;
                 overshootGlide = false;
+                farReturnLB = false;
                 aeroCmdAng = 0;
                 aeroLastT = -1;
                 aPerDegWSm = -1;
@@ -4850,6 +4869,12 @@ namespace BoosterGuidance
                             // Overshoot (rem<=0) unchanged - slam owns it.
                             // Flight-proven f258: crossing vh 344->18.2 vs
                             // f256's 97.5. (vNeedHK/vhRes kept log-only.)
+                            // 批次十九: default-clear every tick BEFORE the
+                            // gate - the flag is set inside the demand block;
+                            // if the gate skips the block (vh==0 mid-burn) a
+                            // stale flag must not leak into the steer compose
+                            bool farReturnPrevK = farReturnLB;
+                            farReturnLB = false;
                             if ((vhNow > 0) || (remHK <= 0))
                             {
                                 // f130 (heavy CRASH, user: 高空乱点火落不下去燃料耗尽):
@@ -5035,7 +5060,61 @@ namespace BoosterGuidance
                                 // (f231's legit 40.1 m/s slam still fires.)
                                 // Sim keeps the vh<5-only law (replay gates)
                                 bool slamCutHK = (vhNow < 5) || (vy >= -15) || ((!simulate) && (vhNow <= 40));
-                                if (overshotHK)
+                                // 批次十九 (方向4 别杀绝, user-approved
+                                // 2026-10-05; f035608 root #3): a far hole is
+                                // a POWERED RETURN, never slam-to-zero-and-
+                                // hand-off. f035608 crossed the pad at
+                                // 503 m/s (drift-to-stop hole 3.2 km), the
+                                // slam killed the outward vh to 36 and
+                                // released into the engine-off glide, whose
+                                // 2-4 m/s2 aero grip walked back ~900 m of
+                                // the 4317 m hole in the 38 s fall ->
+                                // 3410 m miss. Beyond overshootGlideMaxDist
+                                // the burn owns the return: track
+                                // vRet = sqrt(2*aLatFull*dist) pointed AT the
+                                // pad - the same required-velocity shape as
+                                // the approach law, priced at the steer TILT
+                                // budget (the return's delivery channel is
+                                // the up+corr attitude, not the retro-lean,
+                                // so 批次十八's brake-geometry authority does
+                                // not price this leg - 交接同源). The demand
+                                // is the velocity error over tau, sign-correct
+                                // both ways through (vDes-vh): receding or
+                                // stopped far out -> build toward-pad speed;
+                                // inbound faster than the profile -> brake.
+                                // Never silent while the hole exists - the
+                                // ship is never dead-in-air far from the pad
+                                // again. Gates: falcon (starship keeps its
+                                // proven slam/V2G channel), real flight,
+                                // burnLatMode==0 (the glide owns until the
+                                // mode machine hands over - 交接同源),
+                                // falling (vy<-15 = the slam's anti-hover
+                                // cut: the return runs as powered hops, the
+                                // proven slam-coexistence pattern), beyond
+                                // the glide envelope, slower than the return
+                                // profile. Gated on vAlong<vRet rather than
+                                // overshotHK so the stopped-mid-air case is
+                                // covered too (remHK degenerates to +dist at
+                                // vh~0 -> "not overshot" -> the approach
+                                // law's keep-speed silence, the f170 hole).
+                                // Handoff: inbound at vRet the exact-stop
+                                // law's demand (vh^2/2rem = aLatFull on this
+                                // profile) takes over seamlessly; dist<=300
+                                // returns to the legacy glide/v2g regime.
+                                // Sim keeps the legacy slam/silence
+                                // byte-identical (replay gates).
+                                double vRetK = (distHK > 1) ? Math.Sqrt(2 * aLatFull * distHK) : 0;
+                                double vAlongRetK = (distHK > 1) ? Vector3d.Dot(vhVecK, tgtHK / distHK) : 0;
+                                farReturnLB = (!simulate) && (recoveryProfile != "starship") && (burnLatMode == 0)
+                                           && (distHK > overshootGlideMaxDist) && (vAlongRetK < vRetK) && (vy < -15);
+                                if (farReturnLB && !farReturnPrevK)
+                                    Log.Info(string.Format("[LandingBurn] FAR-RETURN engage: t={0:F1} y={1:F0} dist={2:F0} vh={3:F1} vAlong={4:F1} vRet={5:F1} vy={6:F1} - 远距动力返场, 不再杀绝移交滑翔 (批次十九)", t, yG, distHK, vhNow, vAlongRetK, vRetK, vy));
+                                if (farReturnLB)
+                                {
+                                    Vector3d vDesRetK = (tgtHK / distHK) * vRetK;
+                                    aLatReq = Math.Min((vDesRetK - vhVecK).magnitude / tauK, aLatFull);
+                                }
+                                else if (overshotHK)
                                     aLatReq = (((!simulate) && overshootGlide) || slamCutHK) ? 0 : aLatFull;
                                 // 批次十六: slow-handing starship burn - the
                                 // V2G velocity law owns the horizontal channel
@@ -5766,7 +5845,14 @@ namespace BoosterGuidance
                         // the glide owns every slow AND mid-speed overshoot;
                         // only genuinely fast crossings (vh>40, the f219/
                         // f223-era slam design case) go back to the engine
-                        bool overshootGlideM = zoneEnterM && (tGoM > 10) && (closingM <= 0) && (vhM <= 40);
+                        // 批次十九: dist ceiling - beyond
+                        // overshootGlideMaxDist the glide has never walked
+                        // a hole back (f035608: claimed a 4317 m hole,
+                        // recovered ~900 m). Out there the far-return burn
+                        // owns it, and keeping the ship out of AERO also
+                        // keeps the AERO-cut from killing the return's
+                        // engine mid-dash
+                        bool overshootGlideM = zoneEnterM && (tGoM > 10) && (closingM <= 0) && (vhM <= 40) && (distM <= overshootGlideMaxDist);
                         overshootGlide = overshootGlideM;
                         // 保守砍层: honestDrift is DELETED with the ladder
                         // give-up it depended on - a slow overshoot is simply
@@ -5786,7 +5872,18 @@ namespace BoosterGuidance
                         // the approach until the suicide profile genuinely
                         // needs the engine back (zxProf) or the terminal
                         // height/attitude legs fire
-                        bool zxDist = false;
+                        // 批次十九: the dist exit returns, scoped to the
+                        // OUTWARD walk past overshootGlideMaxDist - a glide
+                        // that has walked the hole beyond the proven
+                        // envelope (f218/f220: 66->330 m limit-cycle
+                        // topples; f035608: claimed at 3.2 km, never
+                        // recovered) hands the ship back so the far-return
+                        // burn can take it. The f228 removal above was
+                        // about the <12 m exit stealing a FINISHED job;
+                        // this leg only fires where the glide has no
+                        // record of success. Proven walk-backs (f222 15,
+                        // f224 44, f228 161->12) never cross the line
+                        bool zxDist = (burnLatMode == 1) && (distM > overshootGlideMaxDist);
                         bool zxAlt = (yG <= V2gTermHeightEff);
                         bool zxAtt = (attErrPrevTick > 25);
                         bool zxProf = ((burnLatMode == 1) && (profileDemandLB >= 0.6)); // the suicide profile wants the engine back
@@ -6034,9 +6131,47 @@ namespace BoosterGuidance
                         if (corr.magnitude > allowedF)
                             corr = Vector3d.Normalize(corr) * allowedF;
                     }
+                    // 批次十九: far-return steer. The velocity-law return
+                    // owns the WHOLE attitude: steer = up + corr toward the
+                    // pad profile speed, NOT retro-lean + corr - the
+                    // retro-lean base brakes along -velocity, which fights
+                    // (and at return speed cancels) the very toward-pad
+                    // motion the floor is buying. The correction is the
+                    // same velocity error the floor prices this tick
+                    // (vDes = tgtHat*vRet, vRet from the same tilt budget -
+                    // 交接同源), 1 m/s of error = 1 deg of tilt (the v2g
+                    // idiom), capped at the burn AoA budget; it self-tapers
+                    // as the ship tracks vRet. The f237 lateral-accel cap
+                    // above is NOT applied here: that cap kills the PD
+                    // azimuth-spin limit cycle (small noisy corrections
+                    // pumped at near-full throttle); this correction is
+                    // anchored at the PAD (no error-chase spin mode), its
+                    // throttle is demand-priced by the same law, and
+                    // capping it to 3 m/s2 would re-create the engine-off
+                    // glide's 2-4 m/s2 grip that lost f035608's 3410 m.
+                    // AxisMissComponent/ConeGuard/the AERO governor above
+                    // all wrote corr for pad-bound flight - the return
+                    // replaces the whole command instead of patching each
+                    // (one owner per axis)
+                    if (farReturnLB)
+                    {
+                        Vector3d posErrRet = Vector3d.Exclude(up, tgt_r - r);
+                        double distRet = posErrRet.magnitude;
+                        double maxCorrRet = EffectiveMaxAoALB(landingBurnMaxAoA, yG) * deg2rad;
+                        double vRetS = (distRet > 1) ? Math.Sqrt(2 * amax * Math.Sin(maxCorrRet) * distRet) : 0;
+                        Vector3d vDesRetS = (distRet > 1) ? (posErrRet / distRet) * vRetS : Vector3d.zero;
+                        Vector3d corrRet = (vDesRetS - Vector3d.Exclude(up, vel_air)) * deg2rad;
+                        if (corrRet.magnitude > maxCorrRet)
+                            corrRet = Vector3d.Normalize(corrRet) * maxCorrRet;
+                        steer = up + corrRet;
+                        TagOwnerSteer("term-far-return");
+                    }
+                    else
+                    {
                     // Steer retrograde with added up component to damp oscillations at slow speed near ground
                     steer = -Vector3d.Normalize(vel_air - 20 * up) + corr;
                     TagOwnerSteer("term-falcon");
+                    }
                     }
                 }
                 else
