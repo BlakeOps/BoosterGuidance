@@ -4912,7 +4912,31 @@ namespace BoosterGuidance
                                 // always cheaper than re-buying it under thrust
                                 // (f170, unchanged). Overshoot (remHK<=0) is
                                 // still owned by the slam/glide machinery below.
-                                double aAuthK = (measWarmK && (aMeasHKill > 1)) ? aMeasHKill : aLatFull;
+                                // 批次十八 (user-approved 2026-10-05; f035608 root
+                                // cause #2): break the floor<->measurement self-lock.
+                                // The 批次十一 0.50 authority floor pinned the throttle,
+                                // the decel measured AT that pin then DEFINED aAuthK
+                                // (23 of the ~41 the slam later proved deliverable),
+                                // the demand capped itself at the pin and the ratio
+                                // closure priced back the same 0.50 - a self-sealing
+                                // half-authority loop that priced a deliverable 8.9km
+                                // full-rate kill (844 m/s over 10.1km) as an impossible
+                                // 15.5km half-rate one: 16 s at half rate, the pad
+                                // overflown at 503 m/s, 3.4 km miss. Price authority
+                                // at FULL THROTTLE: the thrust part of the measured
+                                // decel scales with throttle (the same linearity the
+                                // ratio closure below already assumes), so normalize
+                                // by the applied throttle. Denominator floored at
+                                // sustainedAuthorityFloor - the floor regime never
+                                // applies less while it owns the channel, and below
+                                // it the measurement is aero-dominated (the estimate
+                                // then reads <=2x measured: bounded, no fitted value).
+                                // The ratio closure keeps consuming the RAW measured
+                                // decel (delivery at the applied throttle) - plan and
+                                // delivery stay same-source (交接同源).
+                                double aAuthK = (measWarmK && (aMeasHKill > 1))
+                                    ? aMeasHKill / Math.Max(lastAppliedThrottleK, sustainedAuthorityFloor)
+                                    : aLatFull;
                                 double tauK = HGUtils.Clamp(tBand / 3, 2, 6);
                                 double vReqMagK = 0;
                                 double aLatReq;
