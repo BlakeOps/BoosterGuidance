@@ -1030,10 +1030,36 @@ namespace BoosterGuidance
         // vRet = sqrt(2*aAuthK*dist) pointed AT the pad (批次二十: the same
         // measured ledger as the boundary law, 交接同源) and the steer is
         // up+corr (the retro-lean base would brake the very toward-pad
-        // motion the floor is buying). Real flight + falcon + falling only;
-        // recomputed every LandingBurn tick in the demand block, consumed
-        // by the steer compose below. Never set in sim (replay gates).
+        // motion the floor is buying). 批次二十一 v2 (user-approved
+        // 2026-10-08): farReturnLB is now the segment MEMBERSHIP LATCH -
+        // entered while the shared 返场可行 boolean below is true (and the
+        // mode machine owns the burn, burnLatMode==0), exited after 2s of
+        // sustained unviability or IMMEDIATELY on mode handover (mutual
+        // exclusion with the glide). Real flight + falcon only; never set
+        // in sim (replay gates); reset on leaving LandingBurn.
         private bool farReturnLB = false;
+        // 批次二十一 v2: the shared 返场可行 boolean - computed in ONE
+        // place (the demand block) from PHYSICAL QUANTITIES ONLY (no gate
+        // reads another gate's state - the f245 iron rule), consumed by
+        // (1) the segment membership latch above and (2) the glide's 300m
+        // exit (zxDist) in the mode machine. Legs: geometry (批次十九
+        // unchanged); vy hysteresis -15 in / -10 out (f002850 link C: the
+        // aero slow-fall pinned vy at -15±1.5 and bang-banged the old
+        // single-threshold gate at ~2 Hz; the 5 m/s gap is ~3x that
+        // noise); capability - an operational engine (maxThrust>0, the
+        // same signal the suicide law trusts) AND applied throttle above
+        // the idle line: f002850 idled at 0.01-0.13, working floors are
+        // >=0.3, so 0.18 sits in the empty gap. Entry tolerates a cold
+        // throttle (1s spool-up grace); 2s of sustained sub-line throttle
+        // past the grace judges the return unviable (debounce) and latches
+        // capFailed, so a stuck-idle engine cannot flap the segment on the
+        // 3s grace period - re-entry then needs real throttle.
+        private bool farReturnViable = false;
+        private bool farReturnCapFailed = false;
+        private double farReturnEntryT = -100;
+        private double farReturnCapLowT = -1;
+        private double farReturnUnviableT = -1; // membership dwell clock
+        private const double farReturnIdleThrLine = 0.18;
         // 批次十一 (lb-brake-early-high-throttle, user-approved 2026-10-04):
         // sustained authority floor — keep throttle >= 0.5 while vh > 12,
         // so attitude authority is preserved through the taper window.
@@ -1359,7 +1385,9 @@ namespace BoosterGuidance
             v2gBrakeOnlyRadius = v.v2gBrakeOnlyRadius;
             // 批次四 方案X′ measurement state (aMeasHKill/prevVhMagK/
             // lastVhKillMeasT/measWarmK/lastAppliedThrottleK, 批次二十
-            // aMeasFullK/measFullWarmK) is NOT copied,
+            // aMeasFullK/measFullWarmK, 批次二十一
+            // farReturnLB/farReturnViable/farReturnCapFailed + their
+            // clocks) is NOT copied,
             // same as lastt: the sim's t base is its own, and a sim copy
             // re-warms the EMA from its own first two LB ticks (cold start
             // = legacy pricing, ~0.25s) rather than risking a stale slope
@@ -2692,6 +2720,14 @@ namespace BoosterGuidance
                 latModeSince = -1;
                 overshootGlide = false;
                 farReturnLB = false;
+                // 批次二十一: the shared viability boolean + its clocks are
+                // per-burn too - a later burn (or second landing) starts
+                // clean, same as the counter-effect latches below
+                farReturnViable = false;
+                farReturnCapFailed = false;
+                farReturnEntryT = -100;
+                farReturnCapLowT = -1;
+                farReturnUnviableT = -1;
                 aeroCmdAng = 0;
                 aeroLastT = -1;
                 aPerDegWSm = -1;
@@ -4901,12 +4937,13 @@ namespace BoosterGuidance
                             // Overshoot (rem<=0) unchanged - slam owns it.
                             // Flight-proven f258: crossing vh 344->18.2 vs
                             // f256's 97.5. (vNeedHK/vhRes kept log-only.)
-                            // 批次十九: default-clear every tick BEFORE the
-                            // gate - the flag is set inside the demand block;
-                            // if the gate skips the block (vh==0 mid-burn) a
-                            // stale flag must not leak into the steer compose
-                            bool farReturnPrevK = farReturnLB;
-                            farReturnLB = false;
+                            // 批次二十一: farReturnLB is now the segment
+                            // membership LATCH (set/cleared in the demand
+                            // block below) - no per-tick clear. If this
+                            // block is skipped for a tick (vh==0 mid-burn)
+                            // the latch persisting is the CORRECT semantics:
+                            // the steer compose simply continues the segment
+                            // for one tick
                             if ((vhNow > 0) || (remHK <= 0))
                             {
                                 // f130 (heavy CRASH, user: 高空乱点火落不下去燃料耗尽):
@@ -5153,14 +5190,131 @@ namespace BoosterGuidance
                                 // fallback inside it.
                                 double vRetK = (distHK > 1) ? Math.Sqrt(2 * aAuthK * distHK) : 0;
                                 double vAlongRetK = (distHK > 1) ? Vector3d.Dot(vhVecK, tgtHK / distHK) : 0;
-                                farReturnLB = (!simulate) && (recoveryProfile != "starship") && (burnLatMode == 0)
-                                           && (distHK > overshootGlideMaxDist) && (vAlongRetK < vRetK) && (vy < -15);
-                                if (farReturnLB && !farReturnPrevK)
-                                    Log.Info(string.Format("[LandingBurn] FAR-RETURN engage: t={0:F1} y={1:F0} dist={2:F0} vh={3:F1} vAlong={4:F1} vRet={5:F1} vy={6:F1} - 远距动力返场, 不再杀绝移交滑翔 (批次十九)", t, yG, distHK, vhNow, vAlongRetK, vRetK, vy));
+                                // 批次二十一 v2 (user-approved 2026-10-08):
+                                // the shared 返场可行 boolean - computed HERE,
+                                // once per tick, from physical quantities only
+                                // (no gate reads another gate's state - the
+                                // f245 iron rule), consumed by (1) the segment
+                                // membership latch just below and (2) the
+                                // glide's 300m exit (zxDist) in the mode
+                                // machine. Legs: geometry (批次十九 unchanged);
+                                // vy hysteresis -15 in / -10 out (f002850 link
+                                // C: the aero slow-fall pinned vy at -15±1.5
+                                // and bang-banged the old single threshold at
+                                // ~2 Hz; the 5 m/s gap is ~3x that noise);
+                                // capability - an operational engine
+                                // (maxThrust>0, the same signal the suicide
+                                // law trusts) AND applied throttle above the
+                                // idle line. Entry tolerates a cold throttle
+                                // (the 1s grace covers the spool/command
+                                // transition - e.g. the tick the glide hands
+                                // over and the AERO-cut comes off); 2s of
+                                // sustained sub-line throttle past the grace
+                                // = unviable (debounce) + capFailed latched,
+                                // so a stuck-idle engine cannot flap the
+                                // segment on the 3s grace period (re-entry
+                                // then needs real throttle). 洞②: the engine
+                                // "asleep" case is judged HERE at the segment
+                                // level - the steer law carries zero throttle
+                                // reading, so the two segments can never
+                                // couple through it.
+                                if ((!simulate) && (recoveryProfile != "starship"))
+                                {
+                                    bool frGeom = (distHK > overshootGlideMaxDist) && (vAlongRetK < vRetK);
+                                    bool frThrOK = lastAppliedThrottleK >= farReturnIdleThrLine;
+                                    if (!farReturnViable)
+                                    {
+                                        if (frGeom && (vy < -15) && (maxThrust > 0) && (frThrOK || !farReturnCapFailed))
+                                        {
+                                            farReturnViable = true;
+                                            farReturnEntryT = t;
+                                            farReturnCapLowT = -1;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if (frThrOK)
+                                            farReturnCapLowT = -1;
+                                        else if (farReturnCapLowT < 0)
+                                            farReturnCapLowT = t;
+                                        bool capFail = (maxThrust <= 0) || ((farReturnCapLowT >= 0) && (t - Math.Max(farReturnCapLowT, farReturnEntryT + 1.0) > 2.0));
+                                        if ((!frGeom) || (vy > -10) || capFail)
+                                        {
+                                            farReturnViable = false;
+                                            if (capFail && (maxThrust > 0))
+                                                farReturnCapFailed = true;
+                                            Log.Info(string.Format("[LandingBurn] FAR-RETURN unviable: t={0:F1} y={1:F0} dist={2:F0} vh={3:F1} vAlong={4:F1} vRet={5:F1} vy={6:F1} thr={7:F2} reason={8} (批次二十一 - 共享布尔量)", t, yG, distHK, vhNow, vAlongRetK, vRetK, vy, lastAppliedThrottleK, (!frGeom) ? "geometry" : ((vy > -10) ? "vy>-10" : ((maxThrust <= 0) ? "no-engine" : "idle-throttle-2s"))));
+                                        }
+                                    }
+                                    // segment membership: viable -> in segment;
+                                    // unviable SUSTAINED 2s -> the WHOLE segment
+                                    // exits and the far-return steer withdraws
+                                    // with it (洞②: the steer is absorbed by
+                                    // membership, not faded inside the law - a
+                                    // useless idling engine hands the window
+                                    // back to the glide instead of sitting on
+                                    // it: f218's 95 s). A mode handover
+                                    // (burnLatMode!=0 = the glide owns the
+                                    // ship) exits immediately - mutual
+                                    // exclusion.
+                                    if (!farReturnLB)
+                                    {
+                                        farReturnUnviableT = -1;
+                                        if (farReturnViable && (burnLatMode == 0))
+                                        {
+                                            farReturnLB = true;
+                                            Log.Info(string.Format("[LandingBurn] FAR-RETURN engage: t={0:F1} y={1:F0} dist={2:F0} vh={3:F1} vAlong={4:F1} vRet={5:F1} vy={6:F1} - 远距动力返场, 不再杀绝移交滑翔 (批次十九/二十一)", t, yG, distHK, vhNow, vAlongRetK, vRetK, vy));
+                                        }
+                                    }
+                                    else if (burnLatMode != 0)
+                                    {
+                                        farReturnLB = false;
+                                        farReturnUnviableT = -1;
+                                        Log.Info(string.Format("[LandingBurn] FAR-RETURN exit: t={0:F1} y={1:F0} dist={2:F0} vh={3:F1} reason=mode-handover (批次二十一 - 滑翔接管, 立即退出)", t, yG, distHK, vhNow));
+                                    }
+                                    else if (farReturnViable)
+                                    {
+                                        farReturnUnviableT = -1;
+                                    }
+                                    else
+                                    {
+                                        if (farReturnUnviableT < 0)
+                                            farReturnUnviableT = t;
+                                        if (t - farReturnUnviableT > 2.0)
+                                        {
+                                            farReturnLB = false;
+                                            Log.Info(string.Format("[LandingBurn] FAR-RETURN exit: t={0:F1} y={1:F0} dist={2:F0} vh={3:F1} reason=unviable-2s (批次二十一 - 整段退出, 舵随段撤)", t, yG, distHK, vhNow));
+                                        }
+                                    }
+                                }
+                                else
+                                    farReturnLB = false; // sim/starship: legacy silence (replay gates)
                                 if (farReturnLB)
                                 {
                                     Vector3d vDesRetK = (tgtHK / distHK) * vRetK;
-                                    aLatReq = Math.Min((vDesRetK - vhVecK).magnitude / tauK, aAuthK);
+                                    // 批次二十一 v2 垂直账护栏 (洞①的垂直保护
+                                    // + 洞③悬浮旧病, 同一本账): thrust-circle
+                                    // pricing - the vertical profile's share
+                                    // (profileDemandLB, the suicide law's own
+                                    // demand captured BEFORE the floors, tilt
+                                    // compensation included) is deducted from
+                                    // the amax circle FIRST; the lateral
+                                    // return only ever gets the remainder. An
+                                    // order the remainder cannot deliver
+                                    // shrinks to what IS deliverable and
+                                    // slides under the existing deadband =
+                                    // 交不起的单不下 (the f218 SUPPRESSED
+                                    // precedent) - never again a pinned high
+                                    // throttle burning vy on an undeliverable
+                                    // lateral order (f216 hover / f218
+                                    // pinned-14). Free handoff: as the suicide
+                                    // ramp grows near the ground its vertical
+                                    // share collapses the remainder, so the
+                                    // return demand auto-shrinks and yields -
+                                    // 交接靠账不靠门.
+                                    double aVertShareK = profileDemandLB * amax;
+                                    double aLatCircleK = (aVertShareK < amax) ? Math.Sqrt(amax * amax - aVertShareK * aVertShareK) : 0;
+                                    aLatReq = Math.Min((vDesRetK - vhVecK).magnitude / tauK, Math.Min(aAuthK, aLatCircleK));
                                 }
                                 else if (overshotHK)
                                     aLatReq = (((!simulate) && overshootGlide) || slamCutHK) ? 0 : aLatFull;
@@ -5209,7 +5363,26 @@ namespace BoosterGuidance
                                     // glide that then drifted 295→650 m and
                                     // toppled (700 red-mark, batch 10)
                                     bool wasLatchedHK = vhKillLatched;
-                                    if (trajCounterEffectTriggered)
+                                    // 批次二十一 v2 阀的管辖线 (洞①): the
+                                    // counter-effect valve judges NON-far-
+                                    // return powered homing only. It prices a
+                                    // POWERED maneuver with the thrust-LESS
+                                    // Trajectories free-fall mark - a
+                                    // structural misjudge of the return dash
+                                    // (the free-fall mark naturally walks as
+                                    // the dash rebuilds speed; f002850 link D
+                                    // sat the throttle at 0.01 for 47 s while
+                                    // term-far-return steered). Inside the
+                                    // far-return segment its flag neither
+                                    // releases the latch here nor clamps the
+                                    // authority floor below nor fires anew
+                                    // (the sampling block) - the return is
+                                    // governed by the thrust-circle guard
+                                    // instead. If the flag latched BEFORE the
+                                    // segment engaged it simply waits the
+                                    // segment out (it judged the homing it
+                                    // saw; it says nothing about the return).
+                                    if (trajCounterEffectTriggered && (!farReturnLB))
                                         vhKillLatched = false; // counter-effect: immediate unconditional release
                                     else if (aLatReq >= vhKillDeadband)
                                         vhKillLatched = true;
@@ -5260,7 +5433,11 @@ namespace BoosterGuidance
                                 // engine), and disabled once the counter-effect
                                 // flag fires.
                                 double legacyVhKillFloor = vhKillFloor;
-                                if ((!simulate) && (!overshotHK) && (!trajCounterEffectTriggered) && (vhNow > vhKillReleaseVh))
+                                // 批次二十一 v2: the counter-effect flag has no
+                                // jurisdiction inside the far-return segment
+                                // (管辖线 - see the latch site above), so the
+                                // authority floor stays alive through the dash
+                                if ((!simulate) && (!overshotHK) && ((!trajCounterEffectTriggered) || farReturnLB) && (vhNow > vhKillReleaseVh))
                                     vhKillFloor = Math.Max(vhKillFloor, sustainedAuthorityFloor);
                                 if ((!simulate) && (!authorityFloorLatch) && (vhKillFloor > legacyVhKillFloor))
                                 {
@@ -5283,7 +5460,11 @@ namespace BoosterGuidance
                                 // only, no fitted magnitude threshold (the 5 m
                                 // band just rejects prediction jitter). One-shot
                                 // per LB pass (f220 anti-ping-pong).
-                                if ((!simulate) && (!trajCounterEffectTriggered) && (vhKillFloor > 0.3) && (logTransform != null))
+                                // 批次二十一 v2 (洞① 管辖线): while the
+                                // far-return segment owns the tick the valve
+                                // does not even SAMPLE - its thrust-less
+                                // mark says nothing about a powered dash
+                                if ((!simulate) && (!farReturnLB) && (!trajCounterEffectTriggered) && (vhKillFloor > 0.3) && (logTransform != null))
                                 {
                                     Vector3d? impCE = TrajAPI.GetImpactPosition();
                                     if (impCE.HasValue)
@@ -5931,7 +6112,21 @@ namespace BoosterGuidance
                         // this leg only fires where the glide has no
                         // record of success. Proven walk-backs (f222 15,
                         // f224 44, f228 161->12) never cross the line
-                        bool zxDist = (burnLatMode == 1) && (distM > overshootGlideMaxDist);
+                        // 批次二十一 v2 (consumer ② of the shared boolean):
+                        // the exit applies only while the far-return is
+                        // VIABLE. When the engine cannot be counted on the
+                        // glide keeps walking beyond the line - it is the
+                        // only paddle left (f002850 t=313-327: the engine-
+                        // idle aero walk-back recovered 2463->2099 m). No
+                        // deadlock: viability enters the same tick the
+                        // geometry leg trips (entry tolerates the AERO-cut
+                        // idle via the 1s grace), so a healthy engine hands
+                        // over immediately; a genuinely dead one
+                        // (maxThrust==0) never arms the exit at all. The
+                        // boolean is computed once per tick on the throttle
+                        // side from physical quantities only - this line
+                        // reads no gate's state either.
+                        bool zxDist = (burnLatMode == 1) && (distM > overshootGlideMaxDist) && farReturnViable;
                         bool zxAlt = (yG <= V2gTermHeightEff);
                         bool zxAtt = (attErrPrevTick > 25);
                         bool zxProf = ((burnLatMode == 1) && (profileDemandLB >= 0.6)); // the suicide profile wants the engine back
