@@ -47,7 +47,7 @@
 | 36 | engOn | 未熄火发动机数 | |
 | 37 | trajAge | Trajectories 预测年龄 s | |
 | 38 | wallT | 墙钟 HH:mm:ss | 用来对齐 KSP.log 时间窗 |
-| 39 | owner | 当拍转向主控 (vh-kill-floor/vh-kill-slam/AERO-cut/AD-glide/AD-cancel/AD-glide+dragbrake/term-falcon/term-plain...) | |
+| 39 | owner | 当拍转向主控 (vh-kill-floor/vh-kill-slam/AERO-cut/AD-glide/AD-cancel/AD-glide+dragbrake/term-far-return/term-falcon/term-plain...) | **仲裁**: TagOwner（油门地板/事件）无条件覆盖，TagOwnerSteer（舵律）只填空位 — 同拍双写时油门侧永远赢（`steerOwnerTick` 每拍清零， 空位回退 phase 名） |
 | 40 | tags | 异常标记， 竖线分隔 | TERRJMP=预测误差跳>200m; TRAJJMP=落点跳>200m; THRJMP=油门跳>0.3; FLAMEOUT; TILT=LB段tilt>15°; OS-SNAP |
 
 ## 事件行 (# 开头， 不被采样门限过滤）
