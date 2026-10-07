@@ -1027,7 +1027,8 @@ namespace BoosterGuidance
         // 批次十九 (方向4 别杀绝): far-return owns this tick - the ship sits
         // beyond the glide envelope with less than the return-profile speed
         // (stopped or receding included), so the vh-kill demand tracks
-        // vRet = sqrt(2*aLatFull*dist) pointed AT the pad and the steer is
+        // vRet = sqrt(2*aAuthK*dist) pointed AT the pad (批次二十: the same
+        // measured ledger as the boundary law, 交接同源) and the steer is
         // up+corr (the retro-lean base would brake the very toward-pad
         // motion the floor is buying). Real flight + falcon + falling only;
         // recomputed every LandingBurn tick in the demand block, consumed
@@ -1147,6 +1148,16 @@ namespace BoosterGuidance
         private double lastVhKillMeasT = -1;   // t of that sample
         private bool measWarmK = false;        // EMA has its first sample
         private double lastAppliedThrottleK = 0; // last tick's out (applied) throttle
+        // 批次二十 (f002850 根因: the 批次十八 per-unit normalization priced
+        // 42-44 where saturating ticks actually delivered 33-35 = 25%
+        // optimistic; the boundary law saw "no excess" until vh=455 crossed
+        // dist-min at 157m and the slam dug the 2447m hole): full-throttle
+        // delivery ledger. Sample the same -d|vh|/dt slope ONLY on ticks
+        // whose applied throttle saturates - what full throttle delivered is
+        // what the next full-throttle kill will deliver, no linearity
+        // assumption about the aero share. Cold = the 批次十八 price.
+        private double aMeasFullK = 0;         // EMA of -d|vh|/dt at applied thr>=0.95, braking ticks only
+        private bool measFullWarmK = false;    // first such sample seen
         private double lbEntryVh = -1;         // 批次十六: |vh| latched on the first LandingBurn tick (-1 = not in LB / not latched yet); the vhKillV2gOnly branch selector below reads it all burn
         private double lastTermVhFloorLogT = -100; // 批次六 V′-a floor log cadence
         private double lastV2gDbgT = -100;
@@ -1347,7 +1358,8 @@ namespace BoosterGuidance
             v2gTerminal = v.v2gTerminal;
             v2gBrakeOnlyRadius = v.v2gBrakeOnlyRadius;
             // 批次四 方案X′ measurement state (aMeasHKill/prevVhMagK/
-            // lastVhKillMeasT/measWarmK/lastAppliedThrottleK) is NOT copied,
+            // lastVhKillMeasT/measWarmK/lastAppliedThrottleK, 批次二十
+            // aMeasFullK/measFullWarmK) is NOT copied,
             // same as lastt: the sim's t base is its own, and a sim copy
             // re-warms the EMA from its own first two LB ticks (cold start
             // = legacy pricing, ~0.25s) rather than risking a stale slope
@@ -2422,6 +2434,7 @@ namespace BoosterGuidance
             {
                 prevVhMagK = -1;
                 measWarmK = false;
+                measFullWarmK = false; // 批次二十: the full-throttle ledger re-arms per burn too
                 lastVhKillMeasT = -1; // 批次六 ③: the sample clock resets too - a stale clock spanned the non-LB gap into the dtK<5 guard (f274)
                 lbEntryVh = -1;       // 批次十六: the entry-speed latch re-arms for the next burn
             }
@@ -4816,10 +4829,29 @@ namespace BoosterGuidance
                             // above), the SAMPLE STASH is unconditional -
                             // a guarded-out tick still reseeds the clock
                             {
+                                double dtK = t - lastVhKillMeasT;  // window the new sample covers (pre-stash)
+                                double prevVh = prevVhMagK;
                                 double aMeasStep; bool warmStep;
-                                VhKillMeasStep(prevVhMagK, lastVhKillMeasT, vhNow, t, aMeasHKill, measWarmK, out aMeasStep, out warmStep);
+                                VhKillMeasStep(prevVh, lastVhKillMeasT, vhNow, t, aMeasHKill, measWarmK, out aMeasStep, out warmStep);
                                 aMeasHKill = aMeasStep;
                                 measWarmK = warmStep;
+                                // 批次二十: full-throttle delivery ledger. Same slope,
+                                // sampled only while the APPLIED throttle saturates
+                                // (f249: applied, never an intermediate) AND the ship
+                                // is really braking (inst>1, the pricing gate's own
+                                // floor - a far-return/homing tick reads negative and
+                                // would drag the ledger down). No linearity assumption:
+                                // what a saturating tick delivered is what the next
+                                // saturating kill delivers (交接同源).
+                                if ((dtK > 1e-3) && (dtK < 5) && (prevVh >= 0) && (lastAppliedThrottleK >= 0.95))
+                                {
+                                    double instF = (prevVh - vhNow) / dtK;
+                                    if (instF > 1)
+                                    {
+                                        aMeasFullK = measFullWarmK ? aMeasFullK + (instF - aMeasFullK) * Math.Min(1, dtK / 1.0) : instF;
+                                        measFullWarmK = true;
+                                    }
+                                }
                                 prevVhMagK = vhNow;
                                 lastVhKillMeasT = t;
                             }
@@ -4959,9 +4991,19 @@ namespace BoosterGuidance
                                 // The ratio closure keeps consuming the RAW measured
                                 // decel (delivery at the applied throttle) - plan and
                                 // delivery stay same-source (交接同源).
-                                double aAuthK = (measWarmK && (aMeasHKill > 1))
-                                    ? aMeasHKill / Math.Max(lastAppliedThrottleK, sustainedAuthorityFloor)
-                                    : aLatFull;
+                                // 批次二十 (f002850: this normalization priced 42-44
+                                // where saturating ticks delivered 33-35 = 25%
+                                // optimistic - the linearity assumption over-scales
+                                // the aero share of the slope; the boundary law saw
+                                // "no excess" until vh=455 crossed dist-min at 157m,
+                                // the slam dug the 2447m hole): the warm FULL-THROTTLE
+                                // ledger outranks the normalized estimate; the 批次十八
+                                // price remains the cold fallback before the first
+                                // saturating tick.
+                                double aAuthK = measFullWarmK ? aMeasFullK
+                                    : ((measWarmK && (aMeasHKill > 1))
+                                        ? aMeasHKill / Math.Max(lastAppliedThrottleK, sustainedAuthorityFloor)
+                                        : aLatFull);
                                 double tauK = HGUtils.Clamp(tBand / 3, 2, 6);
                                 double vReqMagK = 0;
                                 double aLatReq;
@@ -5098,12 +5140,18 @@ namespace BoosterGuidance
                                 // vh~0 -> "not overshot" -> the approach
                                 // law's keep-speed silence, the f170 hole).
                                 // Handoff: inbound at vRet the exact-stop
-                                // law's demand (vh^2/2rem = aLatFull on this
-                                // profile) takes over seamlessly; dist<=300
-                                // returns to the legacy glide/v2g regime.
+                                // law's demand (vh^2/2rem = the full ledger
+                                // price on this profile) takes over
+                                // seamlessly; dist<=300 returns to the
+                                // legacy glide/v2g regime.
                                 // Sim keeps the legacy slam/silence
                                 // byte-identical (replay gates).
-                                double vRetK = (distHK > 1) ? Math.Sqrt(2 * aLatFull * distHK) : 0;
+                                // 批次二十 (交接同源): the return profile and
+                                // its demand cap price off the same authority
+                                // ledger as the boundary law (aAuthK) - the
+                                // tilt-only aLatFull model is the cold
+                                // fallback inside it.
+                                double vRetK = (distHK > 1) ? Math.Sqrt(2 * aAuthK * distHK) : 0;
                                 double vAlongRetK = (distHK > 1) ? Vector3d.Dot(vhVecK, tgtHK / distHK) : 0;
                                 farReturnLB = (!simulate) && (recoveryProfile != "starship") && (burnLatMode == 0)
                                            && (distHK > overshootGlideMaxDist) && (vAlongRetK < vRetK) && (vy < -15);
@@ -5112,7 +5160,7 @@ namespace BoosterGuidance
                                 if (farReturnLB)
                                 {
                                     Vector3d vDesRetK = (tgtHK / distHK) * vRetK;
-                                    aLatReq = Math.Min((vDesRetK - vhVecK).magnitude / tauK, aLatFull);
+                                    aLatReq = Math.Min((vDesRetK - vhVecK).magnitude / tauK, aAuthK);
                                 }
                                 else if (overshotHK)
                                     aLatReq = (((!simulate) && overshootGlide) || slamCutHK) ? 0 : aLatFull;
@@ -5282,9 +5330,9 @@ namespace BoosterGuidance
                                         if (overshotHK)
                                             Log.Info(string.Format("[LandingBurn] vh-kill SLAM: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} -> thr={5:F2} (overshoot FULL brake, f219 - 过冲全力杀, no more gentle pacing)", vhNow, vy, yG, distHK, remHK, throttle));
                                         else if (ratioPriced)
-                                            Log.Info(string.Format("[LandingBurn] vh-kill floor: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} res={5:F0} tBand={6:F1}s aStop={7:F1} aLatReq={8:F1} aMeas={9:F1} thrPrev={10:F2} -> thr={11:F2} vReq={12:F0} aAuth={13:F1} (方案X′ ratio closure on 批次十六 required-velocity demand)", vhNow, vy, yG, distHK, remHK, vhRes, tBand, aLatStop, aLatReq, aMeasHKill, lastAppliedThrottleK, throttle, vReqMagK, aAuthK));
+                                            Log.Info(string.Format("[LandingBurn] vh-kill floor: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} res={5:F0} tBand={6:F1}s aStop={7:F1} aLatReq={8:F1} aMeas={9:F1} thrPrev={10:F2} -> thr={11:F2} vReq={12:F0} aAuth={13:F1} aFull={14:F1} (方案X′ ratio closure on 批次十六 required-velocity demand)", vhNow, vy, yG, distHK, remHK, vhRes, tBand, aLatStop, aLatReq, aMeasHKill, lastAppliedThrottleK, throttle, vReqMagK, aAuthK, measFullWarmK ? aMeasFullK : double.NaN));
                                         else
-                                            Log.Info(string.Format("[LandingBurn] vh-kill floor: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} res={5:F0} tBand={6:F1}s aStop={7:F1} aLatReq={8:F1}/{9:F1} -> thr={10:F2} vReq={12:F0} aAuth={13:F1} (批次十六 应需速度律; f170 vNeed={11:F0} log-only, aStop log-only)", vhNow, vy, yG, distHK, remHK, vhRes, tBand, aLatStop, aLatReq, aLatFull, throttle, vNeedHK, vReqMagK, aAuthK));
+                                            Log.Info(string.Format("[LandingBurn] vh-kill floor: vh={0:F0} vy={1:F1} y={2:F0} dist={3:F0} rem={4:F0} res={5:F0} tBand={6:F1}s aStop={7:F1} aLatReq={8:F1}/{9:F1} -> thr={10:F2} vReq={12:F0} aAuth={13:F1} aFull={14:F1} (批次十六 应需速度律; f170 vNeed={11:F0} log-only, aStop log-only)", vhNow, vy, yG, distHK, remHK, vhRes, tBand, aLatStop, aLatReq, aLatFull, throttle, vNeedHK, vReqMagK, aAuthK, measFullWarmK ? aMeasFullK : double.NaN));
                                     }
                                 }
                                 }
@@ -6158,7 +6206,18 @@ namespace BoosterGuidance
                         Vector3d posErrRet = Vector3d.Exclude(up, tgt_r - r);
                         double distRet = posErrRet.magnitude;
                         double maxCorrRet = EffectiveMaxAoALB(landingBurnMaxAoA, yG) * deg2rad;
-                        double vRetS = (distRet > 1) ? Math.Sqrt(2 * amax * Math.Sin(maxCorrRet) * distRet) : 0;
+                        // 批次二十 (交接同源): the steer's desired speed prices
+                        // off the SAME authority ledger as the demand side,
+                        // min-capped by the CURRENT tilt budget - this steer
+                        // is up+corr (no retro-lean), so tilt <= maxCorrRet is
+                        // a true bound and a warm EMA may carry high-altitude
+                        // samples into the low-cap zone.
+                        double aAuthRetS = amax * Math.Sin(maxCorrRet);
+                        if (measFullWarmK)
+                            aAuthRetS = Math.Min(aAuthRetS, aMeasFullK);
+                        else if (measWarmK && (aMeasHKill > 1))
+                            aAuthRetS = Math.Min(aAuthRetS, aMeasHKill / Math.Max(lastAppliedThrottleK, sustainedAuthorityFloor));
+                        double vRetS = (distRet > 1) ? Math.Sqrt(2 * aAuthRetS * distRet) : 0;
                         Vector3d vDesRetS = (distRet > 1) ? (posErrRet / distRet) * vRetS : Vector3d.zero;
                         Vector3d corrRet = (vDesRetS - Vector3d.Exclude(up, vel_air)) * deg2rad;
                         if (corrRet.magnitude > maxCorrRet)
